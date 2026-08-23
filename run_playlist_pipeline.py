@@ -3,6 +3,7 @@ import random
 import re
 import subprocess
 import sys
+import hashlib
 import time
 from datetime import datetime
 from pathlib import Path
@@ -3615,6 +3616,29 @@ for html_file in primary_html_files:
                 )
 
             # -----------------------------------------------
+
+                # Materialize persistent cache into the current run.
+                run_secondary = (
+                    HTML_DIR
+                    / (
+                        "secondary_"
+                        + archive_file.name
+                    )
+                )
+
+                if not run_secondary.exists():
+                    run_secondary.write_text(
+                        archive_file.read_text(
+                            encoding="utf-8",
+                            errors="ignore"
+                        ),
+                        encoding="utf-8"
+                    )
+                    print(
+                        "  SECONDARY RUN CACHE CREATED:",
+                        run_secondary
+                    )
+
             # Current run cache fallback.
             # -----------------------------------------------
 
