@@ -551,14 +551,24 @@ def detect_relationship_type(url, soup=None):
     if soup:
         text = clean_text(soup).lower()
 
-        if "sample" in text:
-            return "sampled"
+        # Prefer specific relationship semantics before the
+        # generic word "sample", which may appear elsewhere
+        # on remix/cover/interpolation pages.
+        if "remix" in text:
+            return "remix"
 
         if "cover" in text:
             return "covers"
 
-        if "remix" in text:
-            return "remix"
+        if (
+            "interpolates" in text
+            or "interpolated" in text
+            or "interpolation" in text
+        ):
+            return "interpolates"
+
+        if "sample" in text:
+            return "sampled"
 
     return None
 
@@ -591,6 +601,12 @@ def extract_track(container, relationship_type, timestamp=None):
             if timestamp is not None
             else extract_timestamp(container, relationship_type)
         ),
+
+        # Duration is already parsed above from Schema.org
+        # itemprop="duration"; preserve it in the returned
+        # track object instead of discarding it.
+        "duration":
+            duration,
     }
 
 

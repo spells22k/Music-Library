@@ -7,7 +7,10 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import (
+    unquote,
+    urlparse,
+)
 
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -123,6 +126,46 @@ h1 {
     gap: 12px;
     margin-top: 28px;
 }
+
+.manual-correction {
+    margin-top: 22px;
+    padding: 17px;
+    border: 1px solid #d7dce3;
+    border-radius: 10px;
+    background: #fafbfc;
+}
+
+.manual-correction-title {
+    font-weight: 800;
+    margin-bottom: 6px;
+}
+
+.manual-correction-help {
+    color: #666;
+    font-size: 13px;
+    line-height: 1.45;
+    margin-bottom: 12px;
+}
+
+.manual-field {
+    margin-top: 11px;
+}
+
+.manual-field label {
+    display: block;
+    font-weight: 700;
+    margin-bottom: 5px;
+}
+
+.manual-url-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 12px 13px;
+    border: 1px solid #bbb;
+    border-radius: 8px;
+    font: inherit;
+}
+
 button {
     flex: 1;
     border: 0;
@@ -256,6 +299,51 @@ button {
                     type="hidden"
                     name="decision"
                     id="decision">
+
+                <div class="manual-correction">
+
+                    <div class="manual-correction-title">
+                        Manual WhoSampled correction
+                    </div>
+
+                    <div class="manual-correction-help">
+                        Optional. Supply a corrected canonical
+                        WhoSampled track and/or artist profile.
+                        A manual track URL overrides the displayed
+                        track candidate when ACCEPT is pressed.
+                    </div>
+
+                    <div class="manual-field">
+                        <label for="manual_whosampled_track_url">
+                            Correct WhoSampled track URL
+                        </label>
+
+                        <input
+                            class="manual-url-input"
+                            id="manual_whosampled_track_url"
+                            name="manual_whosampled_track_url"
+                            type="url"
+                            autocomplete="off"
+                            spellcheck="false"
+                            placeholder="https://www.whosampled.com/Artist/Track/">
+                    </div>
+
+                    <div class="manual-field">
+                        <label for="manual_whosampled_artist_url">
+                            Correct WhoSampled artist URL
+                        </label>
+
+                        <input
+                            class="manual-url-input"
+                            id="manual_whosampled_artist_url"
+                            name="manual_whosampled_artist_url"
+                            type="url"
+                            autocomplete="off"
+                            spellcheck="false"
+                            placeholder="https://www.whosampled.com/Artist/">
+                    </div>
+
+                </div>
 
                 <div class="actions">
 
@@ -404,6 +492,110 @@ def normalize_url(value):
     value = value.rstrip("/")
 
     return value
+
+
+def normalize_manual_whosampled_url(
+    value,
+    entity_type,
+):
+    """
+    Structurally validate a contributor-supplied
+    WhoSampled artist or canonical track URL.
+
+    No network request is made here.
+    """
+
+    value = clean(value)
+
+    if not value:
+        return None
+
+    if not value.startswith(
+        (
+            "http://",
+            "https://",
+        )
+    ):
+        value = (
+            "https://"
+            + value.lstrip("/")
+        )
+
+    parsed = urlparse(value)
+
+    host = (
+        parsed.netloc
+        .casefold()
+        .split(":")[0]
+    )
+
+    if host not in {
+        "whosampled.com",
+        "www.whosampled.com",
+    }:
+        return None
+
+    parts = [
+        part
+        for part
+        in parsed.path.strip("/").split("/")
+        if part
+    ]
+
+    forbidden = {
+        "sample",
+        "cover",
+        "remix",
+        "interpolation",
+        "search",
+    }
+
+    if entity_type == "artist":
+
+        if len(parts) != 1:
+            return None
+
+        if parts[0].casefold() in forbidden:
+            return None
+
+        return {
+            "url":
+                (
+                    "https://www.whosampled.com/"
+                    + parts[0]
+                    + "/"
+                ),
+
+            "artist_slug":
+                unquote(parts[0]),
+        }
+
+    if entity_type == "track":
+
+        if len(parts) != 2:
+            return None
+
+        if parts[0].casefold() in forbidden:
+            return None
+
+        return {
+            "url":
+                (
+                    "https://www.whosampled.com/"
+                    + parts[0]
+                    + "/"
+                    + parts[1]
+                    + "/"
+                ),
+
+            "artist_slug":
+                unquote(parts[0]),
+
+            "track_slug":
+                unquote(parts[1]),
+        }
+
+    return None
 
 
 def open_chrome(url):
@@ -930,6 +1122,9 @@ def run_whosampled_review(
     for column in [
         "whosampled_review_decision",
         "whosampled_reviewed_at",
+        "whosampled_review_decision_source",
+        "manual_whosampled_track_url",
+        "manual_whosampled_artist_url",
     ]:
 
         if column not in df.columns:
@@ -1156,6 +1351,70 @@ def run_whosampled_review(
                 )
             )
 
+        manual_track_raw = clean(
+            request.form.get(
+                "manual_whosampled_track_url",
+                "",
+            )
+        )
+
+        manual_artist_raw = clean(
+            request.form.get(
+                "manual_whosampled_artist_url",
+                "",
+            )
+        )
+
+        manual_track = (
+            normalize_manual_whosampled_url(
+                manual_track_raw,
+                "track",
+            )
+            if manual_track_raw
+            else None
+        )
+
+        manual_artist = (
+            normalize_manual_whosampled_url(
+                manual_artist_raw,
+                "artist",
+            )
+            if manual_artist_raw
+            else None
+        )
+
+        if (
+            decision == "y"
+            and manual_track_raw
+            and manual_track is None
+        ):
+            print(
+                "MANUAL WHOSAMPLED TRACK URL REJECTED:",
+                manual_track_raw,
+            )
+
+            return redirect(
+                url_for(
+                    "index"
+                )
+            )
+
+        if (
+            decision == "y"
+            and manual_artist_raw
+            and manual_artist is None
+        ):
+            print(
+                "MANUAL WHOSAMPLED ARTIST URL REJECTED:",
+                manual_artist_raw,
+            )
+
+            return redirect(
+                url_for(
+                    "index"
+                )
+            )
+
         track_key = str(
             row.get(
                 "spotify_track_id",
@@ -1183,8 +1442,48 @@ def run_whosampled_review(
                 ).isoformat(),
 
             "whosampled_url":
-                row.get(
-                    "whosampled_url"
+                (
+                    manual_track.get(
+                        "url"
+                    )
+                    if (
+                        decision == "y"
+                        and manual_track
+                    )
+                    else row.get(
+                        "whosampled_url"
+                    )
+                ),
+
+            "manual_whosampled_track_url":
+                (
+                    manual_track.get(
+                        "url"
+                    )
+                    if manual_track
+                    else ""
+                ),
+
+            "manual_whosampled_artist_url":
+                (
+                    manual_artist.get(
+                        "url"
+                    )
+                    if manual_artist
+                    else ""
+                ),
+
+            "decision_source":
+                (
+                    "manual_contributor_correction"
+                    if (
+                        decision == "y"
+                        and (
+                            manual_track
+                            or manual_artist
+                        )
+                    )
+                    else "contributor_review"
                 ),
 
             "archived_html":
@@ -1340,6 +1639,43 @@ def run_whosampled_review(
             "reviewed_at",
             "",
         )
+
+        df.loc[
+            mask,
+            "whosampled_review_decision_source"
+        ] = result.get(
+            "decision_source",
+            "contributor_review",
+        )
+
+        df.loc[
+            mask,
+            "manual_whosampled_track_url"
+        ] = result.get(
+            "manual_whosampled_track_url",
+            "",
+        )
+
+        df.loc[
+            mask,
+            "manual_whosampled_artist_url"
+        ] = result.get(
+            "manual_whosampled_artist_url",
+            "",
+        )
+
+        if (
+            decision == "accepted"
+            and result.get(
+                "manual_whosampled_track_url"
+            )
+        ):
+            df.loc[
+                mask,
+                "whosampled_url"
+            ] = result.get(
+                "manual_whosampled_track_url"
+            )
 
         if decision == "accepted":
 

@@ -1,4 +1,5 @@
 import os
+import json
 import argparse
 import pandas as pd
 import spotipy
@@ -95,6 +96,27 @@ while results:
             "artist_ids": ", ".join(
                 artist.get("id", "")
                 for artist in artists
+            ),
+
+            # Preserve Spotify's structured artist identities.
+            # The legacy display columns above remain for readability,
+            # but must not be used to reconstruct artist boundaries
+            # because artist names themselves may contain commas.
+            "artists_json": json.dumps(
+                [
+                    {
+                        "id": artist.get("id"),
+                        "name": artist.get("name"),
+                        "uri": artist.get("uri"),
+                        "spotify_url": (
+                            artist
+                            .get("external_urls", {})
+                            .get("spotify")
+                        ),
+                    }
+                    for artist in artists
+                ],
+                ensure_ascii=False,
             ),
 
             "album_name": album.get("name"),

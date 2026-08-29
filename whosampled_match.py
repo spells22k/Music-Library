@@ -99,39 +99,430 @@ def artist_variants(artist_names):
     return artists[:5]
 
 
+# ============================================================
+# WHOSAMPLED TITLE CANDIDATE POLICY
+# ============================================================
+#
+# Candidate construction deliberately separates:
+#
+#   1. recording-title variants
+#   2. punctuation variants
+#   3. Unicode / ASCII variants
+#
+# This prevents slug construction from silently changing
+# recording identity.
+#
+# Example:
+#
+#   Cinco Minutos (5 Minutos)
+#       -> full-title candidates
+#       -> safe parenthetical-stripped candidate: Cinco Minutos
+#
+# but:
+#
+#   Song (Remix)
+#       -> full-title candidates ONLY
+#
+# because "remix" changes recording identity.
+# ============================================================
+
+
+IDENTITY_CHANGING_TITLE_TERMS = {
+    "remix",
+    "remixed",
+    "mix",
+    "cover",
+    "covered",
+    "dub",
+    "rework",
+    "edit",
+    "radio edit",
+    "live",
+    "acoustic",
+    "instrumental",
+    "demo",
+    "karaoke",
+    "mashup",
+    "bootleg",
+}
+
+
+SAFE_EDITION_SUFFIX_TERMS = {
+    "version",
+    "remaster",
+    "remastered",
+    "digital remaster",
+    "mono",
+    "stereo",
+}
+
+
+def normalize_title_descriptor(text):
+    import unicodedata
+
+    text = unicodedata.normalize(
+        "NFKD",
+        str(text or "")
+    )
+
+    text = "".join(
+        c
+        for c in text
+        if not unicodedata.combining(c)
+    )
+
+    text = text.casefold()
+
+    text = re.sub(
+        r"[^\w\s]+",
+        " ",
+        text,
+        flags=re.UNICODE,
+    )
+
+    return " ".join(
+        text.split()
+    )
+
+
+def descriptor_changes_identity(text):
+    """
+    Return True when a descriptor indicates a musically distinct
+    recording/version that must NOT collapse automatically.
+    """
+
+    normalized = normalize_title_descriptor(
+        text
+    )
+
+    if not normalized:
+        return False
+
+    for term in IDENTITY_CHANGING_TITLE_TERMS:
+
+        term_norm = normalize_title_descriptor(
+            term
+        )
+
+        if re.search(
+            r"\b"
+            + re.escape(term_norm)
+            + r"\b",
+            normalized,
+        ):
+            return True
+
+    return False
+
+
+def safe_parenthetical_base_title(title):
+    """
+    Remove parenthetical/bracketed material only when none of the
+    removed descriptors contain identity-changing terminology.
+
+    Examples:
+
+        Cinco Minutos (5 Minutos)
+            -> Cinco Minutos
+
+        Song (Remix)
+            -> unchanged
+
+        Song [Live]
+            -> unchanged
+    """
+
+    title = str(title or "").strip()
+
+    if not title:
+        return ""
+
+    changed = False
+
+    def replace_group(match):
+
+        nonlocal changed
+
+        content = (
+            match.group(1)
+            or match.group(2)
+            or ""
+        )
+
+        if descriptor_changes_identity(
+            content
+        ):
+            return match.group(0)
+
+        changed = True
+        return ""
+
+    result = re.sub(
+        r"\(([^)]*)\)|\[([^\]]*)\]",
+        replace_group,
+        title,
+    )
+
+    result = re.sub(
+        r"\s+",
+        " ",
+        result,
+    ).strip()
+
+    # Clean separators left hanging after removal.
+    result = re.sub(
+        r"\s*[-–—]\s*$",
+        "",
+        result,
+    ).strip()
+
+    if (
+        changed
+        and result
+        and result != title
+    ):
+        return result
+
+    return ""
+
+
+def safe_trailing_edition_base_title(title):
+    """
+    Generate a base candidate for conservative trailing edition
+    descriptors.
+
+    This supports cases such as:
+
+        Lotus 72 D - Fast Version
+            -> Lotus 72 D
+
+        Song - 2004 Digital Remaster
+            -> Song
+
+    Identity-changing descriptors such as Remix, Cover, Dub,
+    Rework, Edit, Live, Acoustic, Instrumental, Demo, etc. are
+    never collapsed.
+    """
+
+    title = str(title or "").strip()
+
+    if not title:
+        return ""
+
+    match = re.match(
+        r"^(.*?)\s+[-–—]\s+(.+?)\s*$",
+        title,
+    )
+
+    if not match:
+        return ""
+
+    base = match.group(1).strip()
+    suffix = match.group(2).strip()
+
+    if not base or not suffix:
+        return ""
+
+    if descriptor_changes_identity(
+        suffix
+    ):
+        return ""
+
+    normalized_suffix = (
+        normalize_title_descriptor(
+            suffix
+        )
+    )
+
+    safe = False
+
+    for term in SAFE_EDITION_SUFFIX_TERMS:
+
+        term_norm = (
+            normalize_title_descriptor(
+                term
+            )
+        )
+
+        if re.search(
+            r"\b"
+            + re.escape(term_norm)
+            + r"\b",
+            normalized_suffix,
+        ):
+            safe = True
+            break
+
+    if not safe:
+        return ""
+
+    return base
+
+
+def title_text_variants(title):
+    """
+    Return recording-title candidates in preferred order.
+
+    Full Spotify title always comes first.
+
+    Safe alternate/base candidates are additive; the original title
+    is never destroyed.
+    """
+
+    title = str(title or "").strip()
+
+    variants = []
+
+    def add(value, strategy):
+
+        value = str(
+            value or ""
+        ).strip()
+
+        if not value:
+            return
+
+        key = (
+            value.casefold()
+        )
+
+        if any(
+            existing["key"] == key
+            for existing in variants
+        ):
+            return
+
+        variants.append({
+            "text": value,
+            "strategy": strategy,
+            "key": key,
+        })
+
+    add(
+        title,
+        "full_title",
+    )
+
+    add(
+        safe_parenthetical_base_title(
+            title
+        ),
+        "safe_parenthetical_base",
+    )
+
+    add(
+        safe_trailing_edition_base_title(
+            title
+        ),
+        "safe_edition_base",
+    )
+
+    # A safe parenthetical removal may expose a safe trailing edition
+    # descriptor, so permit the combination as a final conservative
+    # variant.
+    parenthetical_base = (
+        safe_parenthetical_base_title(
+            title
+        )
+    )
+
+    if parenthetical_base:
+
+        add(
+            safe_trailing_edition_base_title(
+                parenthetical_base
+            ),
+            "safe_parenthetical_and_edition_base",
+        )
+
+    return variants
+
+
+def punctuation_preserving_slugify(
+    text,
+    ascii_only=False,
+):
+    """
+    Preserve meaningful title punctuation while converting spaces
+    to WhoSampled-style hyphens.
+    """
+
+    import unicodedata
+
+    text = str(text or "").strip()
+
+    if not text:
+        return ""
+
+    text = unicodedata.normalize(
+        "NFC",
+        text,
+    )
+
+    text = text.replace("’", "'")
+    text = text.replace("‘", "'")
+    text = text.replace("–", "-")
+    text = text.replace("—", "-")
+
+    if ascii_only:
+
+        text = (
+            unicodedata.normalize(
+                "NFKD",
+                text,
+            )
+            .encode(
+                "ascii",
+                "ignore",
+            )
+            .decode(
+                "ascii"
+            )
+        )
+
+    text = re.sub(
+        r"\s+",
+        "-",
+        text,
+    )
+
+    text = re.sub(
+        r"-+",
+        "-",
+        text,
+    )
+
+    return text.strip("-")
+
+
 def slugify(text):
     """
-    Create a Unicode-preserving WhoSampled-style slug.
+    Unicode, punctuation-reduced title slug.
 
-    Accented characters are preserved here. The URL encoder
-    later converts them to UTF-8 percent-encoding.
+    Parenthetical material is NOT removed here. Recording-title
+    variants must be generated explicitly by title_text_variants().
     """
-    text = str(text).strip()
 
-    # Normalize curly apostrophes.
+    text = str(text or "").strip()
+
     text = text.replace("’", "'")
 
-    # Remove parenthetical/bracketed material.
-    text = re.sub(r"\([^)]*\)", "", text)
-    text = re.sub(r"\[[^\]]*\]", "", text)
-
-    # Replace punctuation/separators with hyphens, but preserve
-    # Unicode letters such as ã, ç, ê, ó, etc.
     text = re.sub(
         r"[^\w]+",
         "-",
         text,
-        flags=re.UNICODE
+        flags=re.UNICODE,
     )
 
-    # Remove underscores created by \w.
-    text = text.replace("_", "-")
+    text = text.replace(
+        "_",
+        "-",
+    )
 
-    # Collapse repeated hyphens.
     text = re.sub(
         r"-+",
         "-",
-        text
+        text,
     )
 
     return text.strip("-")
@@ -139,37 +530,29 @@ def slugify(text):
 
 def ascii_slugify(text):
     """
-    Create an ASCII-transliterated WhoSampled-style slug.
+    ASCII, punctuation-reduced title slug.
 
-    Used as an alternate candidate because WhoSampled is not
-    perfectly consistent about accent preservation.
+    Parenthetical material is intentionally preserved at this stage;
+    safe title reduction happens before slug construction.
     """
+
     import unicodedata
 
-    text = str(text).strip()
+    text = str(text or "").strip()
 
-    text = text.replace("’", "'")
-
-    text = re.sub(
-        r"\([^)]*\)",
-        "",
-        text
-    )
-
-    text = re.sub(
-        r"\[[^\]]*\]",
-        "",
-        text
+    text = text.replace(
+        "’",
+        "'",
     )
 
     text = (
         unicodedata.normalize(
             "NFKD",
-            text
+            text,
         )
         .encode(
             "ascii",
-            "ignore"
+            "ignore",
         )
         .decode(
             "ascii"
@@ -179,28 +562,115 @@ def ascii_slugify(text):
     text = re.sub(
         r"[^A-Za-z0-9]+",
         "-",
-        text
+        text,
     )
 
     text = re.sub(
         r"-+",
         "-",
-        text
+        text,
     )
 
     return text.strip("-")
 
 
-def slug_variants(text):
+def artist_slugify(text):
     """
-    Return Unicode-preserving and ASCII-transliterated variants,
-    deduplicated in preferred order.
+    Create a Unicode-preserving WhoSampled artist slug.
+
+    Artist punctuation is preserved because WhoSampled commonly
+    retains meaningful punctuation in artist URLs.
     """
+
+    import unicodedata
+
+    text = str(text).strip()
+
+    if not text:
+        return ""
+
+    text = unicodedata.normalize(
+        "NFC",
+        text,
+    )
+
+    text = text.replace("’", "'")
+    text = text.replace("‘", "'")
+    text = text.replace("–", "-")
+    text = text.replace("—", "-")
+
+    text = re.sub(
+        r"\s+",
+        "-",
+        text,
+    )
+
+    text = re.sub(
+        r"-+",
+        "-",
+        text,
+    )
+
+    return text.strip("-")
+
+
+def ascii_artist_slugify(text):
+    """
+    ASCII-transliterated artist slug while preserving punctuation
+    that survives transliteration.
+    """
+
+    import unicodedata
+
+    text = str(text).strip()
+
+    if not text:
+        return ""
+
+    text = text.replace("’", "'")
+    text = text.replace("‘", "'")
+    text = text.replace("–", "-")
+    text = text.replace("—", "-")
+
+    text = (
+        unicodedata.normalize(
+            "NFKD",
+            text,
+        )
+        .encode(
+            "ascii",
+            "ignore",
+        )
+        .decode(
+            "ascii"
+        )
+    )
+
+    text = re.sub(
+        r"\s+",
+        "-",
+        text,
+    )
+
+    text = re.sub(
+        r"-+",
+        "-",
+        text,
+    )
+
+    return text.strip("-")
+
+
+def artist_slug_variants(text):
+    """
+    Punctuation-preserving Unicode first, ASCII fallback second.
+    """
+
     variants = []
 
     for value in [
-        slugify(text),
-        ascii_slugify(text),
+        artist_slugify(text),
+        ascii_artist_slugify(text),
     ]:
 
         if (
@@ -212,67 +682,190 @@ def slug_variants(text):
     return variants
 
 
-def canonical_url(artist, title):
-    artist_slug = slugify(artist)
-    title_slug = slugify(title)
+def title_slug_candidates(title):
+    """
+    Build title slugs in this order:
 
-    return (
-        "https://www.whosampled.com/"
-        + quote(
-            artist_slug,
-            safe="-"
+      1. Unicode + punctuation preserved
+      2. Unicode + punctuation reduced
+      3. ASCII + punctuation preserved
+      4. ASCII + punctuation reduced
+
+    for each recording-title candidate, with the full title preceding
+    any safe base-title candidate.
+    """
+
+    candidates = []
+    seen = set()
+
+    for title_variant in title_text_variants(
+        title
+    ):
+
+        text = title_variant["text"]
+
+        forms = [
+            (
+                punctuation_preserving_slugify(
+                    text,
+                    ascii_only=False,
+                ),
+                "unicode_punctuation_preserved",
+            ),
+            (
+                slugify(text),
+                "unicode_punctuation_reduced",
+            ),
+            (
+                punctuation_preserving_slugify(
+                    text,
+                    ascii_only=True,
+                ),
+                "ascii_punctuation_preserved",
+            ),
+            (
+                ascii_slugify(text),
+                "ascii_punctuation_reduced",
+            ),
+        ]
+
+        for slug, slug_strategy in forms:
+
+            if not slug:
+                continue
+
+            key = slug.casefold()
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            candidates.append({
+                "slug": slug,
+                "match_title": text,
+                "title_strategy":
+                    title_variant[
+                        "strategy"
+                    ],
+                "slug_strategy":
+                    slug_strategy,
+            })
+
+    return candidates
+
+
+def slug_variants(text):
+    """
+    Backward-compatible URL-slug list.
+
+    New code should prefer title_slug_candidates() when it needs
+    strategy or match-title metadata.
+    """
+
+    return [
+        candidate["slug"]
+        for candidate in title_slug_candidates(
+            text
         )
-        + "/"
-        + quote(
-            title_slug,
-            safe="-"
-        )
-        + "/"
+    ]
+
+
+def canonical_url(artist, title):
+
+    candidates = canonical_url_candidates(
+        artist,
+        title,
     )
 
+    if candidates:
+        return candidates[0]["url"]
 
-def canonical_url_variants(artist, title):
+    return ""
+
+
+def canonical_url_candidates(
+    artist,
+    title,
+):
     """
-    Generate Unicode-preserving and ASCII-transliterated
-    artist/title combinations.
-
-    Example:
-        João Donato + A Rã
-
-    may produce:
-        /João-Donato/A-Rã/
-        /João-Donato/A-Ra/
-        /Joao-Donato/A-Rã/
-        /Joao-Donato/A-Ra/
+    Return URL candidates together with the exact title variant that
+    should be used to verify that URL.
     """
-    urls = []
 
-    for artist_slug in slug_variants(
+    candidates = []
+    seen = set()
+
+    for artist_slug in artist_slug_variants(
         artist
     ):
 
-        for title_slug in slug_variants(
-            title
+        for title_candidate in (
+            title_slug_candidates(
+                title
+            )
         ):
 
             url = (
                 "https://www.whosampled.com/"
                 + quote(
                     artist_slug,
-                    safe="-"
+                    safe="-",
                 )
                 + "/"
                 + quote(
-                    title_slug,
-                    safe="-"
+                    title_candidate["slug"],
+                    safe="-",
                 )
                 + "/"
             )
 
-            if url not in urls:
-                urls.append(url)
+            if url in seen:
+                continue
 
-    return urls
+            seen.add(url)
+
+            candidates.append({
+                "url":
+                    url,
+
+                "match_title":
+                    title_candidate[
+                        "match_title"
+                    ],
+
+                "title_strategy":
+                    title_candidate[
+                        "title_strategy"
+                    ],
+
+                "slug_strategy":
+                    title_candidate[
+                        "slug_strategy"
+                    ],
+
+                "artist_slug":
+                    artist_slug,
+            })
+
+    return candidates
+
+
+def canonical_url_variants(
+    artist,
+    title,
+):
+    """
+    Backward-compatible URL-only wrapper.
+    """
+
+    return [
+        candidate["url"]
+        for candidate in canonical_url_candidates(
+            artist,
+            title,
+        )
+    ]
 
 
 def is_canonical_track_url(url):
@@ -1157,7 +1750,7 @@ def get_artist_aliases(
     artist_url = (
         "https://www.whosampled.com/"
         + quote(
-            slugify(artist_name),
+            artist_slugify(artist_name),
             safe="-"
         )
         + "/"
@@ -1781,5 +2374,231 @@ def main():
     print("Candidate output:", CANDIDATE_OUTPUT)
 
 
+def run_offline_slug_regression_tests():
+    """
+    Offline known-answer tests.
+
+    No HTTP requests are made.
+    """
+
+    from urllib.parse import unquote
+
+    def url_key(url):
+        return (
+            unquote(
+                str(url)
+            )
+            .rstrip("/")
+            .casefold()
+        )
+
+    fixtures = [
+        {
+            "name":
+                "Secos & Molhados — Sangue Latino",
+
+            "artist":
+                "Secos & Molhados",
+
+            "title":
+                "Sangue Latino",
+
+            "expected":
+                (
+                    "https://www.whosampled.com/"
+                    "Secos-%26-Molhados/"
+                    "Sangue-Latino/"
+                ),
+        },
+        {
+            "name":
+                (
+                    "Erasmo Carlos — "
+                    "É Preciso Dar Um Jeito, Meu Amigo"
+                ),
+
+            "artist":
+                "Erasmo Carlos",
+
+            "title":
+                (
+                    "É Preciso Dar Um Jeito, "
+                    "Meu Amigo"
+                ),
+
+            "expected":
+                (
+                    "https://www.whosampled.com/"
+                    "Erasmo-Carlos/"
+                    "%C3%89-Preciso-Dar-Um-Jeito,"
+                    "-Meu-Amigo/"
+                ),
+        },
+        {
+            "name":
+                (
+                    "Milton Nascimento — "
+                    "Tudo Que Você Podia Ser"
+                ),
+
+            "artist":
+                "Milton Nascimento",
+
+            "title":
+                "Tudo Que Você Podia Ser",
+
+            "expected":
+                (
+                    "https://www.whosampled.com/"
+                    "Milton-Nascimento/"
+                    "Tudo-Que-Voc%C3%AA-Podia-Ser/"
+                ),
+        },
+    ]
+
+    failures = []
+
+    print()
+    print("=" * 72)
+    print("WHOSAMPLED OFFLINE URL REGRESSION TESTS")
+    print("=" * 72)
+
+    for fixture in fixtures:
+
+        generated = (
+            canonical_url_variants(
+                fixture["artist"],
+                fixture["title"],
+            )
+        )
+
+        generated_keys = {
+            url_key(url)
+            for url in generated
+        }
+
+        passed = (
+            url_key(
+                fixture["expected"]
+            )
+            in generated_keys
+        )
+
+        print()
+        print(
+            "PASS"
+            if passed
+            else "FAIL",
+            fixture["name"],
+        )
+
+        print(
+            "  expected:",
+            fixture["expected"],
+        )
+
+        if not passed:
+
+            failures.append(
+                fixture["name"]
+            )
+
+            print(
+                "  generated:"
+            )
+
+            for url in generated:
+                print(
+                    "   ",
+                    url,
+                )
+
+    # --------------------------------------------------------
+    # Safety / behavior tests.
+    # --------------------------------------------------------
+
+    print()
+    print("-" * 72)
+    print("TITLE-VARIANT SAFETY TESTS")
+    print("-" * 72)
+
+    cinco = {
+        item["text"]
+        for item in title_text_variants(
+            "Cinco Minutos (5 Minutos)"
+        )
+    }
+
+    lotus = {
+        item["text"]
+        for item in title_text_variants(
+            "Lotus 72 D - Fast Version"
+        )
+    }
+
+    remix = {
+        item["text"]
+        for item in title_text_variants(
+            "Song (Remix)"
+        )
+    }
+
+    behavior_tests = [
+        (
+            "safe parenthetical candidate",
+            "Cinco Minutos" in cinco,
+        ),
+        (
+            "safe Fast Version candidate",
+            "Lotus 72 D" in lotus,
+        ),
+        (
+            "remix never collapses",
+            "Song" not in remix,
+        ),
+    ]
+
+    for name, passed in behavior_tests:
+
+        print(
+            "PASS"
+            if passed
+            else "FAIL",
+            name,
+        )
+
+        if not passed:
+            failures.append(name)
+
+    print()
+    print("=" * 72)
+
+    if failures:
+
+        print(
+            "FAILED:",
+            len(failures),
+        )
+
+        for failure in failures:
+            print(
+                " -",
+                failure,
+            )
+
+        raise SystemExit(1)
+
+    print(
+        "ALL OFFLINE MATCHING REGRESSIONS PASSED"
+    )
+
+
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if "--self-test-slugs" in sys.argv:
+        run_offline_slug_regression_tests()
+    else:
+        main()

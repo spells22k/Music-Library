@@ -183,6 +183,22 @@ def normalize_track_response(track):
             artist.get("id", "")
             for artist in artists
         ),
+        "artists_json": json.dumps(
+            [
+                {
+                    "id": artist.get("id"),
+                    "name": artist.get("name"),
+                    "uri": artist.get("uri"),
+                    "spotify_url": (
+                        artist
+                        .get("external_urls", {})
+                        .get("spotify")
+                    ),
+                }
+                for artist in artists
+            ],
+            ensure_ascii=False,
+        ),
         "album_id": album.get("id"),
         "album_name": album.get("name"),
         "album_release_date": album.get(
@@ -533,11 +549,79 @@ def title_identity_score(
     )
 
 
+def duration_comparison(
+    target_duration_ms,
+    candidate_duration_ms,
+):
+    """
+    Compare WhoSampled and Spotify recording durations.
+
+    Duration is initially diagnostic evidence rather than a
+    primary identity score. Different releases/masters may
+    legitimately differ by several seconds.
+    """
+
+    try:
+        target_ms = int(
+            float(target_duration_ms)
+        )
+        candidate_ms = int(
+            float(candidate_duration_ms)
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return {
+            "duration_difference_ms": None,
+            "duration_difference_seconds": None,
+            "duration_score": None,
+        }
+
+    if target_ms <= 0 or candidate_ms <= 0:
+        return {
+            "duration_difference_ms": None,
+            "duration_difference_seconds": None,
+            "duration_score": None,
+        }
+
+    difference_ms = abs(
+        target_ms - candidate_ms
+    )
+
+    difference_seconds = (
+        difference_ms / 1000.0
+    )
+
+    if difference_seconds <= 2:
+        duration_score = 1.0
+    elif difference_seconds <= 5:
+        duration_score = 0.90
+    elif difference_seconds <= 10:
+        duration_score = 0.70
+    elif difference_seconds <= 20:
+        duration_score = 0.40
+    else:
+        duration_score = 0.0
+
+    return {
+        "duration_difference_ms":
+            difference_ms,
+
+        "duration_difference_seconds":
+            difference_seconds,
+
+        "duration_score":
+            duration_score,
+    }
+
+
 def score_candidate(
     target_title,
     target_artists,
     target_year,
-    candidate
+    candidate,
+    target_duration_ms=None,
 ):
 
     candidate_artists = [
@@ -694,8 +778,31 @@ def score_candidate(
         )
     )
 
+    duration = duration_comparison(
+        target_duration_ms,
+        candidate.get(
+            "duration_ms"
+        ),
+    )
+
     return {
         "score": score,
+
+        "duration_difference_ms":
+            duration.get(
+                "duration_difference_ms"
+            ),
+
+        "duration_difference_seconds":
+            duration.get(
+                "duration_difference_seconds"
+            ),
+
+        "duration_score":
+            duration.get(
+                "duration_score"
+            ),
+
         "title_score": title_score,
         "artist_score": artist_score,
         "year_score": year_score,
@@ -717,6 +824,7 @@ def resolve_track(
     title,
     artists,
     year=None,
+    duration_ms=None,
     sp=None,
     track_cache=None,
     resolution_cache=None
@@ -812,12 +920,23 @@ def resolve_track(
             )
         )
 
+        # When WhoSampled duration evidence is now available,
+        # re-score the candidates so duration diagnostics can be
+        # calculated and used as a close-score tie-breaker.
+        duration_requires_rescore = (
+            duration_ms not in (
+                None,
+                "",
+            )
+        )
+
         cache_is_safe_match = (
             cached_status == "matched"
             and spotify_track_id
             and cached_year_difference == 0
             and not cached_title_year_conflict
             and not cached_version_conflict
+            and not duration_requires_rescore
         )
 
         if cache_is_safe_match:
@@ -931,7 +1050,8 @@ def resolve_track(
             title,
             artists,
             year,
-            candidate
+            candidate,
+            target_duration_ms=duration_ms,
         )
 
         scored.append({
@@ -939,10 +1059,63 @@ def resolve_track(
             **scores,
         })
 
+    # Primary ranking remains recording-identity score.
     scored.sort(
         key=lambda x: x["score"],
         reverse=True
     )
+
+    # Duration is deliberately only a tie-breaker at this stage.
+    #
+    # If candidates are within 0.03 identity-score points of the
+    # best candidate, prefer the one whose duration agrees most
+    # closely with WhoSampled. This prevents duration from rescuing
+    # a poor title/artist/year match.
+    if (
+        duration_ms not in (
+            None,
+            "",
+        )
+        and scored
+    ):
+        top_identity_score = (
+            scored[0]["score"]
+        )
+
+        close_candidates = [
+            item
+            for item in scored
+            if (
+                top_identity_score
+                - item["score"]
+            ) <= 0.03
+        ]
+
+        close_candidates.sort(
+            key=lambda item: (
+                item.get(
+                    "duration_difference_ms"
+                )
+                if item.get(
+                    "duration_difference_ms"
+                ) is not None
+                else float("inf")
+            )
+        )
+
+        if close_candidates:
+            duration_best = (
+                close_candidates[0]
+            )
+
+            scored.remove(
+                duration_best
+            )
+
+            scored.insert(
+                0,
+                duration_best
+            )
 
     best = scored[0]
 
@@ -1069,6 +1242,24 @@ def resolve_track(
         "match_method": "search",
         "match_score": best["score"],
         "match_margin": margin,
+
+        "whosampled_duration_ms":
+            duration_ms,
+
+        "duration_difference_ms":
+            best.get(
+                "duration_difference_ms"
+            ),
+
+        "duration_difference_seconds":
+            best.get(
+                "duration_difference_seconds"
+            ),
+
+        "duration_score":
+            best.get(
+                "duration_score"
+            ),
     })
 
     # Save canonical Spotify track metadata.
@@ -1093,6 +1284,30 @@ def resolve_track(
         "match_method": "search",
         "match_score": best["score"],
         "match_margin": margin,
+
+        "whosampled_duration_ms":
+            duration_ms,
+
+        "spotify_duration_ms":
+            normalized.get(
+                "duration_ms"
+            ),
+
+        "duration_difference_ms":
+            best.get(
+                "duration_difference_ms"
+            ),
+
+        "duration_difference_seconds":
+            best.get(
+                "duration_difference_seconds"
+            ),
+
+        "duration_score":
+            best.get(
+                "duration_score"
+            ),
+
         "title_score": best.get(
             "title_score"
         ),

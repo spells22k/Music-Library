@@ -1324,6 +1324,12 @@ loadCandidate();
         server.shutdown()
         server.server_close()
 
+    # Persist restored review decisions even when there were no new
+    # interactive decisions in this invocation. Without this call, saved
+    # accepted/rejected decisions exist only in the in-memory DataFrame and
+    # the read below reloads the fresh pre-restoration statuses from disk.
+    persist()
+
     final_df = pd.read_csv(
         enriched_file
     )

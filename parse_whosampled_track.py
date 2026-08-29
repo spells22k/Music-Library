@@ -15,6 +15,75 @@ def clean(text):
     return " ".join(text.split()) if text else ""
 
 
+def parse_iso_duration_ms(value):
+    """
+    Convert the ISO-8601 duration format used by WhoSampled
+    track pages into milliseconds.
+
+    Examples:
+        PT0H2M0S   -> 120000
+        PT0H2M58S  -> 178000
+        PT0H6M22S  -> 382000
+
+    Missing or unrecognized values return None rather than 0.
+    """
+
+    value = clean(value)
+
+    if not value:
+        return None
+
+    match = re.fullmatch(
+        r"PT"
+        r"(?:(\d+(?:\.\d+)?)H)?"
+        r"(?:(\d+(?:\.\d+)?)M)?"
+        r"(?:(\d+(?:\.\d+)?)S)?",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    hours_raw, minutes_raw, seconds_raw = (
+        match.groups()
+    )
+
+    # A bare "PT" is not a usable duration.
+    if not any(
+        (
+            hours_raw,
+            minutes_raw,
+            seconds_raw,
+        )
+    ):
+        return None
+
+    hours = float(
+        hours_raw or 0
+    )
+
+    minutes = float(
+        minutes_raw or 0
+    )
+
+    seconds = float(
+        seconds_raw or 0
+    )
+
+    total_seconds = (
+        hours * 3600
+        + minutes * 60
+        + seconds
+    )
+
+    return int(
+        round(
+            total_seconds * 1000
+        )
+    )
+
+
 def relationship_type_from_url(url):
     url_lower = url.lower()
 
@@ -112,6 +181,7 @@ def extract_source_metadata(soup):
     # --------------------------------------------------------
 
     source_artists = []
+    source_artist_profiles = []
 
     for artist_link in soup.select(
         ".trackArtistNames a[href]"
@@ -132,11 +202,45 @@ def extract_source_metadata(soup):
                 artist
             )
 
+        href = clean(
+            artist_link.get(
+                "href",
+                "",
+            )
+        )
+
+        if not href:
+            continue
+
+        artist_profile_url = urljoin(
+            BASE,
+            href,
+        )
+
+        if not is_artist_link(
+            artist_link.get(
+                "href",
+                "",
+            )
+        ):
+            continue
+
+        profile_item = {
+            "artist": artist,
+            "url": artist_profile_url,
+        }
+
+        if profile_item not in source_artist_profiles:
+            source_artist_profiles.append(
+                profile_item
+            )
+
     # --------------------------------------------------------
     # Producers.
     # --------------------------------------------------------
 
     producers = []
+    producer_profiles = []
 
     for producer in soup.select(
         '[itemprop="producer"] [itemprop="name"]'
@@ -157,6 +261,44 @@ def extract_source_metadata(soup):
                 name
             )
 
+        producer_link = producer.select_one(
+            "a[href]"
+        )
+
+        producer_href = (
+            clean(
+                producer_link.get(
+                    "href",
+                    "",
+                )
+            )
+            if producer_link
+            else ""
+        )
+
+        producer_url = (
+            urljoin(
+                BASE,
+                producer_href,
+            )
+            if producer_href
+            else ""
+        )
+
+        profile_item = {
+            "artist": name,
+            "url": producer_url,
+        }
+
+        if (
+            name
+            and profile_item
+            not in producer_profiles
+        ):
+            producer_profiles.append(
+                profile_item
+            )
+
     # --------------------------------------------------------
     # Structured track credits.
     #
@@ -172,6 +314,7 @@ def extract_source_metadata(soup):
         artist,
         role,
         source_role=None,
+        whosampled_url="",
     ):
 
         artist = clean(
@@ -187,6 +330,16 @@ def extract_source_metadata(soup):
             if source_role is not None
             else role
         )
+
+        whosampled_url = clean(
+            whosampled_url
+        )
+
+        if whosampled_url:
+            whosampled_url = urljoin(
+                BASE,
+                whosampled_url,
+            )
 
         if not artist or not role:
             return
@@ -225,6 +378,7 @@ def extract_source_metadata(soup):
             "artist": artist,
             "role": canonical_role,
             "source_role": source_role,
+            "whosampled_url": whosampled_url,
         }
 
         key = (
@@ -233,18 +387,35 @@ def extract_source_metadata(soup):
             item["source_role"],
         )
 
-        if not any(
-            (
+        for existing in credits:
+            existing_key = (
                 existing["artist"],
                 existing["role"],
                 existing["source_role"],
             )
-            == key
-            for existing in credits
-        ):
-            credits.append(
-                item
-            )
+
+            if existing_key != key:
+                continue
+
+            # Prefer retaining explicit archived profile evidence
+            # when a duplicate credit was first observed without it.
+            if (
+                whosampled_url
+                and not clean(
+                    existing.get(
+                        "whosampled_url"
+                    )
+                )
+            ):
+                existing[
+                    "whosampled_url"
+                ] = whosampled_url
+
+            return
+
+        credits.append(
+            item
+        )
 
     for credit_item in soup.select(
         ".track-credit-item"
@@ -272,6 +443,23 @@ def extract_source_metadata(soup):
 
         for contributor in contributor_nodes:
 
+            contributor_link = (
+                contributor.select_one(
+                    "a[href]"
+                )
+            )
+
+            contributor_href = (
+                clean(
+                    contributor_link.get(
+                        "href",
+                        "",
+                    )
+                )
+                if contributor_link
+                else ""
+            )
+
             add_credit(
                 contributor.get_text(
                     " ",
@@ -279,15 +467,23 @@ def extract_source_metadata(soup):
                 ),
                 role,
                 source_role,
+                contributor_href,
             )
 
     # Producers may be represented separately through Schema.org.
-    for producer in producers:
+    for producer_profile in producer_profiles:
 
         add_credit(
-            producer,
+            producer_profile.get(
+                "artist",
+                ""
+            ),
             "produced_by",
             "Producer",
+            producer_profile.get(
+                "url",
+                ""
+            ),
         )
 
     # --------------------------------------------------------
@@ -357,6 +553,14 @@ def extract_source_metadata(soup):
                 strip=True
             )
         )
+
+    # Preserve WhoSampled's original ISO-8601 value while also
+    # producing milliseconds for direct Spotify comparison.
+    duration_iso = duration
+
+    duration_ms = parse_iso_duration_ms(
+        duration_iso
+    )
 
     genres = []
 
@@ -538,6 +742,12 @@ def extract_source_metadata(soup):
                 source_artists
             ),
 
+        "source_artist_profiles":
+            json.dumps(
+                source_artist_profiles,
+                ensure_ascii=False,
+            ),
+
         "source_producers":
             ", ".join(
                 producers
@@ -558,8 +768,18 @@ def extract_source_metadata(soup):
         "source_release_year":
             release_year,
 
+        # Backward-compatible raw field.
         "source_duration":
-            duration,
+            duration_iso,
+
+        # Explicit source representation.
+        "source_duration_iso":
+            duration_iso,
+
+        # Normalized value directly comparable with
+        # Spotify's duration_ms.
+        "source_duration_ms":
+            duration_ms,
 
         "source_genre":
             ", ".join(
@@ -886,6 +1106,7 @@ def main():
         "source_title",
         "source_url",
         "source_artists",
+        "source_artist_profiles",
         "source_producers",
         "source_credits",
         "source_album",

@@ -23,6 +23,7 @@ from whosampled_match import (
 from parse_whosampled_track import extract_source_metadata, extract_relationships
 from spotify_metadata import resolve_track
 from whosampled_review_ui import run_whosampled_review
+from spotify_review_ui import run_spotify_candidate_review
 from whosampled_media import capture_rendered_artwork
 
 
@@ -30,6 +31,11 @@ PLAYLIST_URL = sys.argv[1]
 
 BLIND_PHASE1_CACHE = (
     "--blind-phase1-cache"
+    in sys.argv[2:]
+)
+
+STOP_AFTER_STEP4 = (
+    "--stop-after-step4"
     in sys.argv[2:]
 )
 
@@ -78,6 +84,7 @@ WHO_SAMPLED_REVIEW_FILE = RUN_DIR / "whosampled_review_decisions.json"
 RELATIONSHIP_FILE = RUN_DIR / "relationships.csv"
 RECORDINGS_FILE = RUN_DIR / "recordings.csv"
 CREDITS_FILE = RUN_DIR / "credits.csv"
+ARTISTS_FILE = RUN_DIR / "artists.csv"
 ENRICHED_FILE = RUN_DIR / "relationships_enriched.csv"
 STATE_FILE = RUN_DIR / "state.json"
 
@@ -152,12 +159,44 @@ def normalize(text):
     )
 
 
-def artist_list(value):
+def artist_list(value, artists_json=""):
+    """
+    Return Spotify track artists without guessing boundaries from commas.
+
+    New Spotify exports preserve the structured artist array in
+    artists_json. The legacy comma-separated display field is used only
+    when structured data is unavailable.
+    """
+
+    raw_json = "" if pd.isna(artists_json) else str(artists_json).strip()
+
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+
+            if isinstance(parsed, list):
+                names = [
+                    str(item.get("name", "")).strip()
+                    for item in parsed
+                    if isinstance(item, dict)
+                    and str(item.get("name", "")).strip()
+                ]
+
+                if names:
+                    return names[:5]
+
+        except Exception as exc:
+            print(
+                "SPOTIFY ARTIST JSON WARNING:",
+                repr(exc)
+            )
+
+    # Legacy fallback for older cached exports.
     return [
         x.strip()
         for x in str(value).split(",")
         if x.strip()
-    ]
+    ][:5]
 
 
 def safe_filename(text):
@@ -211,154 +250,6 @@ def save_artist_slug_cache(data):
     )
 
 
-def learn_artist_slug(
-    spotify_artists,
-    verified_url,
-    source_artists,
-    cache
-):
-    """
-    Learn a canonical WhoSampled artist slug only for the
-    Spotify artist that corresponds to the WhoSampled source artist.
-
-    This is important for multi-artist Spotify tracks. For example:
-
-        Spotify:
-            Toquinho, Jorge Ben Jor
-
-        WhoSampled:
-            Toquinho
-
-    must produce only:
-
-        Toquinho -> Toquinho
-
-    and must NOT produce:
-
-        Jorge Ben Jor -> Toquinho
-    """
-
-    if not verified_url:
-        return
-
-    path = (
-        str(verified_url)
-        .split(
-            "whosampled.com",
-            1
-        )[-1]
-        .strip("/")
-    )
-
-    parts = [
-        part
-        for part in path.split("/")
-        if part
-    ]
-
-    # Verified track URL must be /Artist/Track/.
-    if len(parts) != 2:
-        return
-
-    canonical_slug = parts[0]
-
-    if not canonical_slug:
-        return
-
-    ws_artists = [
-        normalize(a)
-        for a in str(
-            source_artists
-            or ""
-        ).split(",")
-        if str(a).strip()
-    ]
-
-    spotify_artist_pairs = [
-        (
-            artist,
-            normalize(artist)
-        )
-        for artist in spotify_artists
-        if str(artist).strip()
-    ]
-
-    matching_spotify_artists = []
-
-    for original_artist, normalized_artist in (
-        spotify_artist_pairs
-    ):
-
-        if any(
-            normalized_artist == ws_artist
-            or normalized_artist in ws_artist
-            or ws_artist in normalized_artist
-            for ws_artist in ws_artists
-        ):
-            matching_spotify_artists.append(
-                original_artist
-            )
-
-    # If WhoSampled source metadata is unavailable or no Spotify
-    # artist matches it, do NOT guess. This prevents contaminating
-    # the learned-slug cache on multi-artist tracks.
-    if len(matching_spotify_artists) != 1:
-
-        print(
-            "SLUG LEARNING SKIPPED:",
-            "could not uniquely identify Spotify artist for",
-            canonical_slug,
-            "WhoSampled artists:",
-            source_artists
-        )
-
-        return
-
-    artist = matching_spotify_artists[0]
-    key = normalize(artist)
-
-    current = cache.get(
-        key,
-        []
-    )
-
-    if isinstance(
-        current,
-        str
-    ):
-        current = [current]
-
-    current = [
-        str(x)
-        for x in current
-        if str(x).strip()
-    ]
-
-    updated = [canonical_slug]
-
-    for slug in current:
-        if normalize(slug) != normalize(
-            canonical_slug
-        ):
-            updated.append(slug)
-
-    if updated != current:
-
-        cache[key] = updated
-
-        save_artist_slug_cache(
-            cache
-        )
-
-        print(
-            "LEARNED WHO SAMPLED ARTIST SLUG:",
-            artist,
-            "→",
-            canonical_slug
-        )
-
-
-
 def write_dataframe(df, path):
     df.to_csv(
         path,
@@ -374,27 +265,40 @@ def write_normalized_outputs(
     relationship_rows,
 ):
     """
-    Write the normalized Phase-1 data model:
+    Write the normalized pipeline data model.
+
+    Spotify is the baseline source of identity for playlist seed
+    recordings and playlist artists.
+
+    WhoSampled enriches those identities when a verified match exists.
+
+    Outputs:
 
         recordings.csv
-            one row per approved source recording
+            one row for every Spotify playlist recording,
+            plus any future source-only recordings
+
+        artists.csv
+            one row for every structured Spotify artist identity,
+            plus WhoSampled credit artists not yet reconciled to Spotify
 
         credits.csv
-            one row per structured artist/role credit
+            recording-to-artist role assertions with source provenance
 
         relationships.csv
-            one row per relationship
+            recording-to-recording musical relationships
 
-    This function uses only already-collected local HTML and CSV
-    files. It performs no network requests.
+    This function uses only already-collected local HTML and CSV files.
+    It performs no network requests.
     """
 
     import hashlib
     import json
+
     from bs4 import BeautifulSoup
+
     from parse_whosampled_track import (
         extract_source_metadata,
-        extract_relationships,
     )
 
     matched_df = pd.read_csv(
@@ -406,62 +310,704 @@ def write_normalized_outputs(
     )
 
     # --------------------------------------------------------
-    # Spotify lookup by the playlist recording's Spotify ID.
+    # Helpers.
     # --------------------------------------------------------
 
-    spotify_by_id = {}
+    def clean(value):
+        if pd.isna(value):
+            return ""
+        return str(value).strip()
 
-    for _, row in spotify_df.iterrows():
+    def stable_id(prefix, namespace, value):
+        raw = (
+            f"{namespace}:"
+            f"{value}"
+        )
 
-        spotify_id = str(
+        return (
+            prefix
+            + hashlib.sha1(
+                raw.encode("utf-8")
+            ).hexdigest()[:16]
+        )
+
+    def ws_url_key(url):
+        value = clean(url)
+
+        if not value:
+            return ""
+
+        return (
+            unquote(value)
+            .rstrip("/")
+            .casefold()
+        )
+
+    def parse_spotify_artists(row):
+        """
+        Prefer the structured artists_json field.
+
+        A legacy fallback is retained for old cached Spotify exports,
+        but new exports should always contain artists_json.
+        """
+
+        raw_json = clean(
             row.get(
-                "spotify_track_id",
-                "",
+                "artists_json",
+                ""
             )
-            or ""
-        ).strip()
+        )
 
-        if spotify_id:
-            spotify_by_id[
-                spotify_id
-            ] = row.to_dict()
+        if raw_json:
+            try:
+                parsed = json.loads(
+                    raw_json
+                )
+
+                if isinstance(
+                    parsed,
+                    list
+                ):
+                    return [
+                        item
+                        for item in parsed
+                        if isinstance(
+                            item,
+                            dict
+                        )
+                    ]
+
+            except Exception as exc:
+                print(
+                    "SPOTIFY ARTIST JSON WARNING:",
+                    repr(exc),
+                )
+
+        # Legacy fallback.
+        ids = [
+            value.strip()
+            for value in clean(
+                row.get(
+                    "artist_ids",
+                    ""
+                )
+            ).split(",")
+            if value.strip()
+        ]
+
+        names_raw = clean(
+            row.get(
+                "artist_names",
+                ""
+            )
+        )
+
+        # One Spotify artist ID means the whole display string belongs
+        # to that one artist, even if the artist name contains commas.
+        if len(ids) == 1:
+
+            return [{
+                "id": ids[0],
+                "name": names_raw,
+                "uri": "",
+                "spotify_url": "",
+            }]
+
+        # This fallback is inherently ambiguous for multi-artist legacy
+        # rows whose artist names themselves contain commas. It exists
+        # only so older cached exports do not crash.
+        names = [
+            value.strip()
+            for value in names_raw.split(",")
+            if value.strip()
+        ]
+
+        if ids and len(ids) == len(names):
+
+            return [
+                {
+                    "id": artist_id,
+                    "name": artist_name,
+                    "uri": "",
+                    "spotify_url": (
+                        "https://open.spotify.com/artist/"
+                        + artist_id
+                    ),
+                }
+                for artist_id, artist_name
+                in zip(ids, names)
+            ]
+
+        if names_raw:
+
+            print(
+                "LEGACY SPOTIFY ARTIST WARNING:",
+                clean(
+                    row.get(
+                        "title",
+                        ""
+                    )
+                ),
+                "could not safely reconstruct "
+                "structured artist identities."
+            )
+
+        return []
 
     # --------------------------------------------------------
-    # WhoSampled match lookup.
+    # WhoSampled match lookups.
     # --------------------------------------------------------
 
+    match_by_spotify_id = {}
     match_by_url = {}
 
     for _, row in matched_df.iterrows():
 
-        url = str(
+        spotify_id = clean(
             row.get(
-                "whosampled_url",
-                "",
+                "spotify_track_id",
+                ""
             )
-            or ""
-        ).strip().rstrip("/")
+        )
 
-        if url:
-
-            match_by_url[
-                url
+        if spotify_id:
+            match_by_spotify_id[
+                spotify_id
             ] = row.to_dict()
 
-    recording_rows = []
-    credit_rows = []
-    normalized_relationship_rows = []
+        url_key = ws_url_key(
+            row.get(
+                "whosampled_url",
+                ""
+            )
+        )
 
-    recording_ids_by_url = {}
+        if url_key:
+            match_by_url[
+                url_key
+            ] = row.to_dict()
 
     # --------------------------------------------------------
-    # Recordings + credits from approved primary pages.
+    # Canonical in-memory stores.
+    # --------------------------------------------------------
+
+    recordings_by_id = {}
+    recording_ids_by_spotify_id = {}
+    recording_ids_by_url = {}
+
+    artists_by_id = {}
+    spotify_artist_ids = {}
+    spotify_artist_name_ids = {}
+
+    credit_rows = []
+    seen_credit_keys = set()
+
+    normalized_relationship_rows = []
+
+    # --------------------------------------------------------
+    # Credits helper.
+    # --------------------------------------------------------
+
+    def add_credit(
+        recording_id,
+        artist_id,
+        artist_name,
+        role,
+        source_role,
+        source,
+        source_url,
+        artist_order="",
+    ):
+        artist_name = clean(
+            artist_name
+        )
+
+        role = clean(
+            role
+        )
+
+        if (
+            not recording_id
+            or not artist_name
+            or not role
+        ):
+            return
+
+        credit_key = (
+            f"{recording_id}|"
+            f"{artist_id}|"
+            f"{artist_name}|"
+            f"{role}|"
+            f"{source_role}|"
+            f"{source}"
+        )
+
+        if credit_key in seen_credit_keys:
+            return
+
+        seen_credit_keys.add(
+            credit_key
+        )
+
+        credit_id = stable_id(
+            "CRD_",
+            "credit",
+            credit_key,
+        )
+
+        credit_rows.append({
+            "credit_id":
+                credit_id,
+
+            "recording_id":
+                recording_id,
+
+            "artist_id":
+                artist_id,
+
+            "artist_name":
+                artist_name,
+
+            "role":
+                role,
+
+            "source_role":
+                clean(
+                    source_role
+                ),
+
+            "artist_order":
+                artist_order,
+
+            "source":
+                clean(
+                    source
+                ),
+
+            "source_url":
+                clean(
+                    source_url
+                ),
+        })
+
+    # --------------------------------------------------------
+    # STEP A
+    #
+    # Every Spotify playlist track becomes a canonical recording.
+    # Every structured Spotify artist becomes a canonical artist.
+    # --------------------------------------------------------
+
+    for _, row in spotify_df.iterrows():
+
+        spotify_track_id = clean(
+            row.get(
+                "spotify_track_id",
+                ""
+            )
+        )
+
+        if not spotify_track_id:
+            continue
+
+        recording_id = stable_id(
+            "REC_",
+            "spotify",
+            spotify_track_id,
+        )
+
+        recording_ids_by_spotify_id[
+            spotify_track_id
+        ] = recording_id
+
+        match_row = (
+            match_by_spotify_id.get(
+                spotify_track_id,
+                {}
+            )
+        )
+
+        whosampled_url = clean(
+            match_row.get(
+                "whosampled_url",
+                ""
+            )
+        )
+
+        whosampled_status = clean(
+            match_row.get(
+                "match_status",
+                ""
+            )
+        )
+
+        if whosampled_url:
+            recording_ids_by_url[
+                ws_url_key(
+                    whosampled_url
+                )
+            ] = recording_id
+
+        album_release_date = clean(
+            row.get(
+                "album_release_date",
+                ""
+            )
+        )
+
+        release_year = (
+            album_release_date[:4]
+            if album_release_date
+            else ""
+        )
+
+        recordings_by_id[
+            recording_id
+        ] = {
+            "recording_id":
+                recording_id,
+
+            # Canonical working fields.
+            # Spotify initializes them for seed recordings.
+            "title":
+                clean(
+                    row.get(
+                        "title",
+                        ""
+                    )
+                ),
+
+            "artist_names":
+                clean(
+                    row.get(
+                        "artist_names",
+                        ""
+                    )
+                ),
+
+            "album":
+                clean(
+                    row.get(
+                        "album_name",
+                        ""
+                    )
+                ),
+
+            "label":
+                clean(
+                    row.get(
+                        "album_label",
+                        ""
+                    )
+                ),
+
+            "release_year":
+                release_year,
+
+            "duration":
+                clean(
+                    row.get(
+                        "duration_ms",
+                        ""
+                    )
+                ),
+
+            "genre":
+                "",
+
+            "keywords":
+                "",
+
+            # Spotify provenance.
+            "spotify_track_id":
+                spotify_track_id,
+
+            "spotify_uri":
+                clean(
+                    row.get(
+                        "spotify_uri",
+                        ""
+                    )
+                ),
+
+            "spotify_url":
+                clean(
+                    row.get(
+                        "spotify_url",
+                        ""
+                    )
+                ),
+
+            "spotify_isrc":
+                clean(
+                    row.get(
+                        "isrc",
+                        ""
+                    )
+                ),
+
+            "spotify_album_name":
+                clean(
+                    row.get(
+                        "album_name",
+                        ""
+                    )
+                ),
+
+            "spotify_album_id":
+                clean(
+                    row.get(
+                        "album_id",
+                        ""
+                    )
+                ),
+
+            "spotify_album_release_date":
+                album_release_date,
+
+            "spotify_album_release_precision":
+                clean(
+                    row.get(
+                        "album_release_precision",
+                        ""
+                    )
+                ),
+
+            "spotify_album_image_url":
+                clean(
+                    row.get(
+                        "album_image_url",
+                        ""
+                    )
+                ),
+
+            "spotify_album_label":
+                clean(
+                    row.get(
+                        "album_label",
+                        ""
+                    )
+                ),
+
+            "spotify_duration_ms":
+                clean(
+                    row.get(
+                        "duration_ms",
+                        ""
+                    )
+                ),
+
+            # Phase-1 WhoSampled resolution state exists even if
+            # no WhoSampled page was found.
+            "whosampled_match_status":
+                whosampled_status,
+
+            "whosampled_url":
+                whosampled_url,
+
+            # WhoSampled enrichment fields.
+            "whosampled_title":
+                "",
+
+            "whosampled_artist_names":
+                "",
+
+            "whosampled_album":
+                "",
+
+            "whosampled_label":
+                "",
+
+            "whosampled_release_year":
+                "",
+
+            "whosampled_duration":
+                "",
+
+            "whosampled_genre":
+                "",
+
+            "whosampled_keywords":
+                "",
+
+            "whosampled_thumbnail_url":
+                "",
+
+            "whosampled_thumbnail_path":
+                "",
+
+            "whosampled_thumbnail_status":
+                "unavailable",
+
+            "youtube_video_id":
+                "",
+
+            "youtube_url":
+                "",
+
+            "youtube_thumbnail_url":
+                "",
+
+            # Future enrichment source slots.
+            "musicbrainz_recording_id":
+                "",
+
+            "musicbrainz_release_id":
+                "",
+
+            "musicbrainz_country":
+                "",
+
+            "musicbrainz_label":
+                "",
+        }
+
+        spotify_artists = (
+            parse_spotify_artists(
+                row
+            )
+        )
+
+        for artist_order, artist in enumerate(
+            spotify_artists,
+            start=1,
+        ):
+
+            spotify_artist_id = clean(
+                artist.get(
+                    "id",
+                    ""
+                )
+            )
+
+            artist_name = clean(
+                artist.get(
+                    "name",
+                    ""
+                )
+            )
+
+            if not (
+                spotify_artist_id
+                and artist_name
+            ):
+                continue
+
+            artist_id = stable_id(
+                "ART_",
+                "spotify",
+                spotify_artist_id,
+            )
+
+            spotify_artist_ids[
+                spotify_artist_id
+            ] = artist_id
+
+            name_key = normalize(
+                artist_name
+            )
+
+            if name_key:
+                spotify_artist_name_ids.setdefault(
+                    name_key,
+                    []
+                )
+
+                if (
+                    artist_id
+                    not in spotify_artist_name_ids[
+                        name_key
+                    ]
+                ):
+                    spotify_artist_name_ids[
+                        name_key
+                    ].append(
+                        artist_id
+                    )
+
+            artists_by_id[
+                artist_id
+            ] = {
+                "artist_id":
+                    artist_id,
+
+                "canonical_name":
+                    artist_name,
+
+                "spotify_artist_id":
+                    spotify_artist_id,
+
+                "spotify_uri":
+                    clean(
+                        artist.get(
+                            "uri",
+                            ""
+                        )
+                    ),
+
+                "spotify_url":
+                    clean(
+                        artist.get(
+                            "spotify_url",
+                            ""
+                        )
+                    ),
+
+                "whosampled_name":
+                    "",
+
+                "whosampled_url":
+                    "",
+
+                "wikidata_qid":
+                    "",
+
+                "musicbrainz_artist_id":
+                    "",
+            }
+
+            add_credit(
+                recording_id=
+                    recording_id,
+
+                artist_id=
+                    artist_id,
+
+                artist_name=
+                    artist_name,
+
+                role=
+                    "performer",
+
+                source_role=
+                    "Spotify track artist",
+
+                source=
+                    "Spotify",
+
+                source_url=
+                    clean(
+                        row.get(
+                            "spotify_url",
+                            ""
+                        )
+                    ),
+
+                artist_order=
+                    artist_order,
+            )
+
+    # --------------------------------------------------------
+    # STEP B
+    #
+    # Approved WhoSampled primary pages enrich existing Spotify
+    # recordings. They no longer determine whether a recording exists.
     # --------------------------------------------------------
 
     for html_file in accepted_html_files:
 
         html_path = (
-            HTML_DIR / html_file
+            HTML_DIR
+            / html_file
         )
 
         if not html_path.exists():
@@ -477,8 +1023,10 @@ def write_normalized_outputs(
                 "html.parser",
             )
 
-            source = extract_source_metadata(
-                soup
+            source = (
+                extract_source_metadata(
+                    soup
+                )
             )
 
         except Exception as exc:
@@ -488,31 +1036,180 @@ def write_normalized_outputs(
                 html_path,
                 repr(exc),
             )
+
             continue
 
-        source_url = str(
+        source_url = clean(
             source.get(
                 "source_url",
-                "",
+                ""
             )
-            or ""
-        ).strip().rstrip("/")
+        ).rstrip("/")
 
         if not source_url:
             continue
 
-        recording_id = (
-            "REC_"
-            + hashlib.sha1(
-                source_url.encode(
-                    "utf-8"
-                )
-            ).hexdigest()[:16]
+        source_url_key = (
+            ws_url_key(
+                source_url
+            )
         )
 
+        matched_row = (
+            match_by_url.get(
+                source_url_key,
+                {}
+            )
+        )
+
+        spotify_track_id = clean(
+            matched_row.get(
+                "spotify_track_id",
+                ""
+            )
+        )
+
+        recording_id = (
+            recording_ids_by_spotify_id.get(
+                spotify_track_id,
+                ""
+            )
+        )
+
+        # Defensive fallback:
+        # preserve a verified WhoSampled recording even if its Spotify
+        # bridge is unexpectedly absent. This should be rare for seed
+        # pages but prevents silent data loss.
+        if not recording_id:
+
+            recording_id = stable_id(
+                "REC_",
+                "whosampled",
+                source_url_key,
+            )
+
+            if recording_id not in recordings_by_id:
+
+                recordings_by_id[
+                    recording_id
+                ] = {
+                    "recording_id":
+                        recording_id,
+
+                    "title":
+                        clean(
+                            source.get(
+                                "source_title",
+                                ""
+                            )
+                        ),
+
+                    "artist_names":
+                        clean(
+                            source.get(
+                                "source_artists",
+                                ""
+                            )
+                        ),
+
+                    "album":
+                        clean(
+                            source.get(
+                                "source_album",
+                                ""
+                            )
+                        ),
+
+                    "label":
+                        clean(
+                            source.get(
+                                "source_label",
+                                ""
+                            )
+                        ),
+
+                    "release_year":
+                        clean(
+                            source.get(
+                                "source_release_year",
+                                ""
+                            )
+                        ),
+
+                    "duration":
+                        clean(
+                            source.get(
+                                "source_duration",
+                                ""
+                            )
+                        ),
+
+                    "genre":
+                        clean(
+                            source.get(
+                                "source_genre",
+                                ""
+                            )
+                        ),
+
+                    "keywords":
+                        clean(
+                            source.get(
+                                "source_keywords",
+                                ""
+                            )
+                        ),
+
+                    "spotify_track_id": "",
+                    "spotify_uri": "",
+                    "spotify_url": "",
+                    "spotify_isrc": "",
+                    "spotify_album_name": "",
+                    "spotify_album_id": "",
+                    "spotify_album_release_date": "",
+                    "spotify_album_release_precision": "",
+                    "spotify_album_image_url": "",
+                    "spotify_album_label": "",
+                    "spotify_duration_ms": "",
+
+                    "whosampled_match_status":
+                        "matched",
+
+                    "whosampled_url":
+                        source_url,
+
+                    "whosampled_title": "",
+                    "whosampled_artist_names": "",
+                    "whosampled_album": "",
+                    "whosampled_label": "",
+                    "whosampled_release_year": "",
+                    "whosampled_duration": "",
+                    "whosampled_genre": "",
+                    "whosampled_keywords": "",
+                    "whosampled_thumbnail_url": "",
+                    "whosampled_thumbnail_path": "",
+                    "whosampled_thumbnail_status":
+                        "unavailable",
+
+                    "youtube_video_id": "",
+                    "youtube_url": "",
+                    "youtube_thumbnail_url": "",
+
+                    "musicbrainz_recording_id": "",
+                    "musicbrainz_release_id": "",
+                    "musicbrainz_country": "",
+                    "musicbrainz_label": "",
+                }
+
         recording_ids_by_url[
-            source_url
+            source_url_key
         ] = recording_id
+
+        recording = (
+            recordings_by_id[
+                recording_id
+            ]
+        )
 
         local_thumbnail = (
             HTML_DIR.parent
@@ -523,146 +1220,83 @@ def write_normalized_outputs(
             )
         )
 
-        # ----------------------------------------------------
-        # One recording row.
-        # ----------------------------------------------------
-
-        # ----------------------------------------------------
-        # Spotify identity comes from matched_tracks.csv.
-        #
-        # That file records the human-reviewed / automated
-        # correspondence between this WhoSampled recording and
-        # the Spotify recording. It is therefore the authoritative
-        # bridge between the two source systems.
-        # ----------------------------------------------------
-
-        spotify_track_id = str(
-            matched_row.get(
-                "spotify_track_id",
-                "",
-            )
-            or ""
-        ).strip()
-
-        spotify_isrc = str(
-            matched_row.get(
-                "isrc",
-                "",
-            )
-            or ""
-        ).strip()
-
-        # ----------------------------------------------------
-        # Spotify metadata is then looked up by Spotify track ID.
-        # ----------------------------------------------------
-
-        spotify_row = (
-            spotify_by_id.get(
-                spotify_track_id,
-                {}
-            )
-        )
-
-        spotify_url = str(
-            spotify_row.get(
-                "spotify_url",
-                "",
-            )
-            or ""
-        ).strip()
-
-        spotify_album_name = str(
-            spotify_row.get(
-                "album_name",
-                "",
-            )
-            or ""
-        ).strip()
-
-        spotify_album_release_date = str(
-            spotify_row.get(
-                "album_release_date",
-                "",
-            )
-            or ""
-        ).strip()
-
-        spotify_album_image_url = str(
-            spotify_row.get(
-                "album_image_url",
-                "",
-            )
-            or ""
-        ).strip()
-
-        spotify_album_label = str(
-            spotify_row.get(
-                "album_label",
-                "",
-            )
-            or ""
-        ).strip()
-
-        recording_rows.append({
-
-            "recording_id":
-                recording_id,
-
-            "title":
-                source.get(
-                    "source_title",
-                    "",
-                ),
-
-            "artist_names":
-                source.get(
-                    "source_artists",
-                    "",
-                ),
-
-            "album":
-                source.get(
-                    "source_album",
-                    "",
-                ),
-
-            "label":
-                source.get(
-                    "source_label",
-                    "",
-                ),
-
-            "release_year":
-                source.get(
-                    "source_release_year",
-                    "",
-                ),
-
-            "duration":
-                source.get(
-                    "source_duration",
-                    "",
-                ),
-
-            "genre":
-                source.get(
-                    "source_genre",
-                    "",
-                ),
-
-            "keywords":
-                source.get(
-                    "source_keywords",
-                    "",
-                ),
+        recording.update({
+            "whosampled_match_status":
+                "matched",
 
             "whosampled_url":
                 source_url,
 
+            "whosampled_title":
+                clean(
+                    source.get(
+                        "source_title",
+                        ""
+                    )
+                ),
+
+            "whosampled_artist_names":
+                clean(
+                    source.get(
+                        "source_artists",
+                        ""
+                    )
+                ),
+
+            "whosampled_album":
+                clean(
+                    source.get(
+                        "source_album",
+                        ""
+                    )
+                ),
+
+            "whosampled_label":
+                clean(
+                    source.get(
+                        "source_label",
+                        ""
+                    )
+                ),
+
+            "whosampled_release_year":
+                clean(
+                    source.get(
+                        "source_release_year",
+                        ""
+                    )
+                ),
+
+            "whosampled_duration":
+                clean(
+                    source.get(
+                        "source_duration",
+                        ""
+                    )
+                ),
+
+            "whosampled_genre":
+                clean(
+                    source.get(
+                        "source_genre",
+                        ""
+                    )
+                ),
+
+            "whosampled_keywords":
+                clean(
+                    source.get(
+                        "source_keywords",
+                        ""
+                    )
+                ),
+
             "whosampled_thumbnail_url":
-                source.get(
-                    "source_thumbnail_url",
-                    "",
+                clean(
+                    source.get(
+                        "source_thumbnail_url",
+                        ""
+                    )
                 ),
 
             "whosampled_thumbnail_path":
@@ -682,49 +1316,410 @@ def write_normalized_outputs(
                 ),
 
             "youtube_video_id":
-                source.get(
-                    "source_youtube_video_id",
-                    "",
+                clean(
+                    source.get(
+                        "source_youtube_video_id",
+                        ""
+                    )
                 ),
 
             "youtube_url":
-                source.get(
-                    "source_youtube_url",
-                    "",
+                clean(
+                    source.get(
+                        "source_youtube_url",
+                        ""
+                    )
                 ),
 
             "youtube_thumbnail_url":
-                source.get(
-                    "source_youtube_thumbnail_url",
-                    "",
+                clean(
+                    source.get(
+                        "source_youtube_thumbnail_url",
+                        ""
+                    )
                 ),
-
-            # Spotify identity / metadata for the playlist
-            # recording, where already available.
-            "spotify_track_id":
-                spotify_track_id,
-
-            "spotify_url":
-                spotify_url,
-
-            "spotify_isrc":
-                spotify_isrc,
-
-            "spotify_album_name":
-                spotify_album_name,
-
-            "spotify_album_release_date":
-                spotify_album_release_date,
-
-            "spotify_album_image_url":
-                spotify_album_image_url,
-
-            "spotify_album_label":
-                spotify_album_label,
         })
 
+        # If this is a WhoSampled-only fallback recording, allow its
+        # source metadata to initialize otherwise-empty canonical fields.
+        for canonical_field, ws_field in (
+            ("title", "whosampled_title"),
+            ("artist_names", "whosampled_artist_names"),
+            ("album", "whosampled_album"),
+            ("label", "whosampled_label"),
+            ("release_year", "whosampled_release_year"),
+            ("duration", "whosampled_duration"),
+            ("genre", "whosampled_genre"),
+            ("keywords", "whosampled_keywords"),
+        ):
+
+            if not clean(
+                recording.get(
+                    canonical_field,
+                    ""
+                )
+            ):
+                recording[
+                    canonical_field
+                ] = clean(
+                    recording.get(
+                        ws_field,
+                        ""
+                    )
+                )
+
         # ----------------------------------------------------
-        # Structured credits.
+        # Literal WhoSampled primary-artist profile identities.
+        #
+        # extract_source_metadata() preserves the exact artist
+        # profile links present on the verified WhoSampled track
+        # page in source_artist_profiles. These URLs are direct
+        # WhoSampled evidence and must not be reconstructed from
+        # Spotify/Wikidata spelling.
+        #
+        # Reconciliation policy:
+        #   1. Reuse an artist already carrying this exact
+        #      WhoSampled profile URL.
+        #   2. Otherwise enrich a Spotify artist only when the
+        #      normalized WhoSampled name maps uniquely in this run.
+        #   3. Otherwise create a deterministic WhoSampled-profile
+        #      artist identity keyed by the literal profile URL.
+        # ----------------------------------------------------
+
+        raw_artist_profiles = source.get(
+            "source_artist_profiles",
+            "[]",
+        )
+
+        try:
+
+            parsed_artist_profiles = json.loads(
+                raw_artist_profiles
+                or "[]"
+            )
+
+        except Exception:
+
+            parsed_artist_profiles = []
+
+        if not isinstance(
+            parsed_artist_profiles,
+            list,
+        ):
+
+            parsed_artist_profiles = []
+
+        for artist_order, profile in enumerate(
+            parsed_artist_profiles,
+            start=1,
+        ):
+
+            if not isinstance(
+                profile,
+                dict,
+            ):
+                continue
+
+            artist_name = clean(
+                profile.get(
+                    "artist",
+                    profile.get(
+                        "name",
+                        "",
+                    ),
+                )
+            )
+
+            artist_profile_url = clean(
+                profile.get(
+                    "url",
+                    "",
+                )
+            )
+
+            if not (
+                artist_name
+                and artist_profile_url
+            ):
+                continue
+
+            artist_profile_url_key = ws_url_key(
+                artist_profile_url
+            )
+
+            # First preference: an artist already carrying this
+            # exact literal WhoSampled profile URL.
+            artist_id = ""
+
+            for existing_artist_id, existing_artist in (
+                artists_by_id.items()
+            ):
+
+                existing_whosampled_url = clean(
+                    existing_artist.get(
+                        "whosampled_url",
+                        "",
+                    )
+                )
+
+                if (
+                    existing_whosampled_url
+                    and ws_url_key(
+                        existing_whosampled_url
+                    )
+                    == artist_profile_url_key
+                ):
+
+                    artist_id = existing_artist_id
+                    break
+
+            # Second preference: uniquely attributable Spotify
+            # artist identity by normalized name.
+            if not artist_id:
+
+                artist_name_key = normalize(
+                    artist_name
+                )
+
+                possible_spotify_ids = (
+                    spotify_artist_name_ids.get(
+                        artist_name_key,
+                        [],
+                    )
+                )
+
+                if len(
+                    possible_spotify_ids
+                ) == 1:
+
+                    artist_id = (
+                        possible_spotify_ids[0]
+                    )
+
+            # Third preference: reconcile the literal WhoSampled
+            # profile to a Spotify-backed artist through an already
+            # learned Spotify-name -> WhoSampled-slug mapping.
+            #
+            # This handles legitimate cross-source naming differences
+            # such as Spotify "Jorge Ben Jor" versus WhoSampled
+            # "Jorge Ben". The literal profile URL remains the
+            # authoritative WhoSampled identity; the learned slug is
+            # used only as cross-source reconciliation evidence.
+            #
+            # Require the learned evidence to identify exactly one
+            # Spotify-backed artist in this run. Ambiguous evidence
+            # falls through to the deterministic WhoSampled-profile
+            # identity rather than guessing.
+            if not artist_id:
+
+                try:
+                    profile_parts = [
+                        part
+                        for part in urlparse(
+                            artist_profile_url
+                        ).path.split("/")
+                        if part
+                    ]
+
+                    literal_profile_slug = (
+                        unquote(
+                            profile_parts[0]
+                        )
+                        if len(profile_parts) == 1
+                        else ""
+                    )
+
+                except Exception:
+                    literal_profile_slug = ""
+
+                learned_spotify_artist_ids = []
+
+                if literal_profile_slug:
+
+                    literal_slug_key = normalize(
+                        literal_profile_slug.replace(
+                            "-",
+                            " ",
+                        )
+                    )
+
+                    for (
+                        learned_artist_name_key,
+                        learned_slugs,
+                    ) in artist_slug_cache.items():
+
+                        if isinstance(
+                            learned_slugs,
+                            str,
+                        ):
+                            learned_slugs = [
+                                learned_slugs
+                            ]
+
+                        if not isinstance(
+                            learned_slugs,
+                            (list, tuple, set),
+                        ):
+                            continue
+
+                        learned_slug_matches = any(
+                            normalize(
+                                str(slug).replace(
+                                    "-",
+                                    " ",
+                                )
+                            )
+                            == literal_slug_key
+                            for slug in learned_slugs
+                            if clean(slug)
+                        )
+
+                        if not learned_slug_matches:
+                            continue
+
+                        for possible_artist_id in (
+                            spotify_artist_name_ids.get(
+                                normalize(
+                                    learned_artist_name_key
+                                ),
+                                [],
+                            )
+                        ):
+
+                            if (
+                                possible_artist_id
+                                not in learned_spotify_artist_ids
+                            ):
+                                learned_spotify_artist_ids.append(
+                                    possible_artist_id
+                                )
+
+                if len(
+                    learned_spotify_artist_ids
+                ) == 1:
+
+                    artist_id = (
+                        learned_spotify_artist_ids[0]
+                    )
+
+                    print(
+                        "RECONCILED LITERAL WHOSAMPLED PROFILE "
+                        "TO SPOTIFY ARTIST VIA LEARNED SLUG:",
+                        artist_name,
+                        "->",
+                        artist_profile_url,
+                        "->",
+                        artists_by_id.get(
+                            artist_id,
+                            {},
+                        ).get(
+                            "canonical_name",
+                            artist_id,
+                        ),
+                    )
+
+            # Otherwise preserve the literal WhoSampled profile as
+            # its own deterministic artist identity. The external
+            # URL, rather than the display spelling, is the key.
+            if not artist_id:
+
+                artist_id = stable_id(
+                    "ART_",
+                    "whosampled-profile",
+                    artist_profile_url_key,
+                )
+
+            if artist_id not in artists_by_id:
+
+                artists_by_id[
+                    artist_id
+                ] = {
+                    "artist_id":
+                        artist_id,
+
+                    "canonical_name":
+                        artist_name,
+
+                    "spotify_artist_id":
+                        "",
+
+                    "spotify_uri":
+                        "",
+
+                    "spotify_url":
+                        "",
+
+                    "whosampled_name":
+                        artist_name,
+
+                    "whosampled_url":
+                        artist_profile_url,
+
+                    "wikidata_qid":
+                        "",
+
+                    "musicbrainz_artist_id":
+                        "",
+                }
+
+            else:
+
+                artist_record = (
+                    artists_by_id[
+                        artist_id
+                    ]
+                )
+
+                if not clean(
+                    artist_record.get(
+                        "whosampled_name",
+                        "",
+                    )
+                ):
+
+                    artist_record[
+                        "whosampled_name"
+                    ] = artist_name
+
+                if not clean(
+                    artist_record.get(
+                        "whosampled_url",
+                        "",
+                    )
+                ):
+
+                    artist_record[
+                        "whosampled_url"
+                    ] = artist_profile_url
+
+            add_credit(
+                recording_id=
+                    recording_id,
+
+                artist_id=
+                    artist_id,
+
+                artist_name=
+                    artist_name,
+
+                role=
+                    "performer",
+
+                source_role=
+                    "WhoSampled primary artist",
+
+                source=
+                    "WhoSampled",
+
+                source_url=
+                    source_url,
+
+                artist_order=
+                    artist_order,
+            )
+
+        # ----------------------------------------------------
+        # WhoSampled structured credits.
         # ----------------------------------------------------
 
         raw_credits = source.get(
@@ -745,93 +1740,143 @@ def write_normalized_outputs(
 
         for credit in parsed_credits:
 
-            artist_name = str(
+            artist_name = clean(
                 credit.get(
                     "artist",
-                    "",
+                    ""
                 )
-                or ""
-            ).strip()
+            )
 
-            role = str(
+            role = clean(
                 credit.get(
                     "role",
-                    "",
+                    ""
                 )
-                or ""
-            ).strip()
+            )
 
-            source_role = str(
+            source_role = clean(
                 credit.get(
                     "source_role",
-                    "",
+                    ""
                 )
-                or ""
-            ).strip()
+            )
 
-            if not artist_name or not role:
+            if not (
+                artist_name
+                and role
+            ):
                 continue
 
-            credit_key = (
-                f"{recording_id}|"
-                f"{artist_name}|"
-                f"{role}|"
-                f"{source_role}"
+            artist_name_key = normalize(
+                artist_name
             )
 
-            credit_id = (
-                "CRD_"
-                + hashlib.sha1(
-                    credit_key.encode(
-                        "utf-8"
-                    )
-                ).hexdigest()[:16]
+            possible_spotify_ids = (
+                spotify_artist_name_ids.get(
+                    artist_name_key,
+                    []
+                )
             )
 
-            credit_rows.append({
+            # Reuse a Spotify artist identity only when the normalized
+            # name maps uniquely within this run. Otherwise preserve the
+            # WhoSampled observation as its own unresolved artist identity.
+            if len(possible_spotify_ids) == 1:
 
-                "credit_id":
-                    credit_id,
+                artist_id = (
+                    possible_spotify_ids[0]
+                )
 
-                "recording_id":
+                artists_by_id[
+                    artist_id
+                ][
+                    "whosampled_name"
+                ] = artist_name
+
+            else:
+
+                artist_id = stable_id(
+                    "ART_",
+                    "whosampled-name",
+                    artist_name_key,
+                )
+
+                if artist_id not in artists_by_id:
+
+                    artists_by_id[
+                        artist_id
+                    ] = {
+                        "artist_id":
+                            artist_id,
+
+                        "canonical_name":
+                            artist_name,
+
+                        "spotify_artist_id":
+                            "",
+
+                        "spotify_uri":
+                            "",
+
+                        "spotify_url":
+                            "",
+
+                        "whosampled_name":
+                            artist_name,
+
+                        "whosampled_url":
+                            "",
+
+                        "wikidata_qid":
+                            "",
+
+                        "musicbrainz_artist_id":
+                            "",
+                    }
+
+            add_credit(
+                recording_id=
                     recording_id,
 
-                "artist_name":
+                artist_id=
+                    artist_id,
+
+                artist_name=
                     artist_name,
 
-                "role":
+                role=
                     role,
 
-                "source_role":
+                source_role=
                     source_role,
 
-                "source":
+                source=
                     "WhoSampled",
 
-                "source_url":
+                source_url=
                     source_url,
-            })
+            )
 
     # --------------------------------------------------------
-    # Relationships.
+    # STEP C
     #
-    # Target recording identity is intentionally empty until
-    # the related recording's own WhoSampled page is collected.
+    # Normalize track-to-track relationships.
     # --------------------------------------------------------
 
     for row in relationship_rows:
 
-        source_url = str(
+        source_url = clean(
             row.get(
                 "source_url",
-                "",
+                ""
             )
-            or ""
-        ).strip().rstrip("/")
+        )
 
         source_recording_id = (
             recording_ids_by_url.get(
-                source_url,
+                ws_url_key(
+                    source_url
+                ),
                 ""
             )
         )
@@ -844,17 +1889,13 @@ def write_normalized_outputs(
             f"{row.get('whosampled_relationship_url', '')}"
         )
 
-        relationship_id = (
-            "REL_"
-            + hashlib.sha1(
-                relationship_key.encode(
-                    "utf-8"
-                )
-            ).hexdigest()[:16]
+        relationship_id = stable_id(
+            "REL_",
+            "relationship",
+            relationship_key,
         )
 
         normalized_relationship_rows.append({
-
             "relationship_id":
                 relationship_id,
 
@@ -901,8 +1942,16 @@ def write_normalized_outputs(
                 ),
         })
 
+    # --------------------------------------------------------
+    # Write outputs.
+    # --------------------------------------------------------
+
     recordings_df = pd.DataFrame(
-        recording_rows
+        recordings_by_id.values()
+    )
+
+    artists_df = pd.DataFrame(
+        artists_by_id.values()
     )
 
     credits_df = pd.DataFrame(
@@ -916,6 +1965,11 @@ def write_normalized_outputs(
     write_dataframe(
         recordings_df,
         RECORDINGS_FILE
+    )
+
+    write_dataframe(
+        artists_df,
+        ARTISTS_FILE
     )
 
     write_dataframe(
@@ -939,6 +1993,11 @@ def write_normalized_outputs(
     )
 
     print(
+        "Artists:",
+        len(artists_df),
+    )
+
+    print(
         "Credits:",
         len(credits_df),
     )
@@ -949,13 +2008,300 @@ def write_normalized_outputs(
     )
 
 
+def integrate_step5_spotify_targets(enriched_df):
+    """
+    Fold accepted Step-5 Spotify resolutions back into the canonical
+    recordings/artists/credits/relationships outputs.
+
+    Only rows whose final spotify_match_status is "matched" are integrated.
+    Review rows therefore enter the graph only after explicit acceptance by
+    spotify_review_ui. Unmatched/not_found/unresolved rows remain unchanged.
+
+    Identity policy:
+      * Recording identity is deterministic from Spotify track ID.
+      * Existing playlist Recording IDs are reused automatically because the
+        same stable-ID namespace is used by write_normalized_outputs().
+      * Multiple relationship rows resolving to one Spotify track reuse one
+        Recording node.
+      * Spotify artists are materialized only when artist IDs are available;
+        display-name parsing is never used to invent artist identity.
+    """
+
+    def clean(value):
+        if pd.isna(value):
+            return ""
+        return str(value).strip()
+
+    def stable_id(prefix, namespace, value):
+        raw = f"{namespace}:{value}"
+        return prefix + hashlib.sha1(
+            raw.encode("utf-8")
+        ).hexdigest()[:16]
+
+    if enriched_df is None or enriched_df.empty:
+        print("STEP 5 CANONICAL INTEGRATION: no enriched rows")
+        return
+
+    recordings_df = pd.read_csv(RECORDINGS_FILE)
+    artists_df = pd.read_csv(ARTISTS_FILE)
+    credits_df = pd.read_csv(CREDITS_FILE)
+    canonical_relationships_df = pd.read_csv(RELATIONSHIP_FILE)
+
+    # Relationship IDs are string graph identifiers. Force object dtype so
+    # filling previously blank target_recording_id cells never relies on
+    # pandas' float/NaN inference.
+    if "target_recording_id" in canonical_relationships_df.columns:
+        canonical_relationships_df["target_recording_id"] = (
+            canonical_relationships_df["target_recording_id"]
+            .fillna("")
+            .astype(object)
+        )
+
+    recording_columns = list(recordings_df.columns)
+    artist_columns = list(artists_df.columns)
+    credit_columns = list(credits_df.columns)
+
+    recordings = {
+        clean(row.get("recording_id")): row.to_dict()
+        for _, row in recordings_df.iterrows()
+        if clean(row.get("recording_id"))
+    }
+    recording_id_by_spotify = {
+        clean(row.get("spotify_track_id")): clean(row.get("recording_id"))
+        for _, row in recordings_df.iterrows()
+        if clean(row.get("spotify_track_id"))
+    }
+
+    artists = {
+        clean(row.get("artist_id")): row.to_dict()
+        for _, row in artists_df.iterrows()
+        if clean(row.get("artist_id"))
+    }
+    artist_id_by_spotify = {
+        clean(row.get("spotify_artist_id")): clean(row.get("artist_id"))
+        for _, row in artists_df.iterrows()
+        if clean(row.get("spotify_artist_id"))
+    }
+
+    credits = [row.to_dict() for _, row in credits_df.iterrows()]
+    credit_keys = {
+        (
+            clean(row.get("recording_id")),
+            clean(row.get("artist_id")),
+            clean(row.get("role")),
+            clean(row.get("source_role")),
+            clean(row.get("source")),
+            clean(row.get("source_url")),
+        )
+        for row in credits
+    }
+
+    relationship_index = {
+        clean(row.get("whosampled_relationship_url")): index
+        for index, row in canonical_relationships_df.iterrows()
+        if clean(row.get("whosampled_relationship_url"))
+    }
+
+    integrated_relationships = 0
+    created_recordings = 0
+    reused_recordings = 0
+    created_artists = 0
+    created_credits = 0
+    matched_without_artist_ids = 0
+
+    for _, row in enriched_df.iterrows():
+
+        if clean(row.get("spotify_match_status")).lower() != "matched":
+            continue
+
+        spotify_track_id = clean(row.get("spotify_track_id"))
+        relationship_url = clean(row.get("whosampled_relationship_url"))
+
+        if not spotify_track_id or not relationship_url:
+            continue
+
+        recording_id = recording_id_by_spotify.get(spotify_track_id)
+
+        if recording_id:
+            reused_recordings += 1
+        else:
+            recording_id = stable_id(
+                "REC_",
+                "spotify",
+                spotify_track_id,
+            )
+            recording_id_by_spotify[spotify_track_id] = recording_id
+
+            release_date = clean(row.get("spotify_album_release_date"))
+            spotify_url = clean(row.get("spotify_url")) or (
+                "https://open.spotify.com/track/" + spotify_track_id
+            )
+
+            new_recording = {column: "" for column in recording_columns}
+            new_recording.update({
+                "recording_id": recording_id,
+                "title": clean(row.get("spotify_title")) or clean(row.get("related_track")),
+                "artist_names": clean(row.get("spotify_artist_names")) or clean(row.get("related_artist")),
+                "album": clean(row.get("spotify_album_name")),
+                "label": clean(row.get("spotify_album_label")),
+                "release_year": release_date[:4] if release_date else clean(row.get("year"))[:4],
+                "duration": clean(row.get("spotify_duration_ms")),
+                "spotify_track_id": spotify_track_id,
+                "spotify_uri": clean(row.get("spotify_uri")),
+                "spotify_url": spotify_url,
+                "spotify_isrc": clean(row.get("spotify_isrc")),
+                "spotify_album_name": clean(row.get("spotify_album_name")),
+                "spotify_album_id": clean(row.get("spotify_album_id")),
+                "spotify_album_release_date": release_date,
+                "spotify_album_release_precision": clean(row.get("spotify_album_release_precision")),
+                "spotify_album_image_url": clean(row.get("spotify_album_image_url")),
+                "spotify_album_label": clean(row.get("spotify_album_label")),
+                "spotify_duration_ms": clean(row.get("spotify_duration_ms")),
+                "whosampled_match_status": "relationship_evidence",
+                "whosampled_title": clean(row.get("related_track")),
+                "whosampled_artist_names": clean(row.get("related_artist")),
+            })
+            recordings[recording_id] = new_recording
+            created_recordings += 1
+
+        relationship_row_index = relationship_index.get(relationship_url)
+        if relationship_row_index is not None:
+            canonical_relationships_df.at[
+                relationship_row_index,
+                "target_recording_id",
+            ] = recording_id
+            integrated_relationships += 1
+
+        raw_artist_ids = clean(row.get("spotify_artist_ids"))
+        raw_artist_names = clean(row.get("spotify_artist_names"))
+
+        artist_ids = [
+            value.strip()
+            for value in raw_artist_ids.split(",")
+            if value.strip()
+        ]
+        artist_names = [
+            value.strip()
+            for value in raw_artist_names.split(",")
+            if value.strip()
+        ]
+
+        if not artist_ids:
+            matched_without_artist_ids += 1
+            continue
+
+        if len(artist_ids) != len(artist_names):
+            print(
+                "STEP 5 ARTIST STRUCTURE WARNING:",
+                clean(row.get("spotify_title")),
+                "artist IDs/names could not be paired safely; credits skipped."
+            )
+            matched_without_artist_ids += 1
+            continue
+
+        spotify_track_url = clean(row.get("spotify_url")) or (
+            "https://open.spotify.com/track/" + spotify_track_id
+        )
+
+        for artist_order, (spotify_artist_id, artist_name) in enumerate(
+            zip(artist_ids, artist_names),
+            start=1,
+        ):
+            artist_id = artist_id_by_spotify.get(spotify_artist_id)
+
+            if not artist_id:
+                artist_id = stable_id(
+                    "ART_",
+                    "spotify",
+                    spotify_artist_id,
+                )
+                artist_id_by_spotify[spotify_artist_id] = artist_id
+
+                new_artist = {column: "" for column in artist_columns}
+                new_artist.update({
+                    "artist_id": artist_id,
+                    "canonical_name": artist_name,
+                    "spotify_artist_id": spotify_artist_id,
+                    "spotify_uri": "spotify:artist:" + spotify_artist_id,
+                    "spotify_url": "https://open.spotify.com/artist/" + spotify_artist_id,
+                })
+                artists[artist_id] = new_artist
+                created_artists += 1
+
+            credit_key = (
+                recording_id,
+                artist_id,
+                "performer",
+                "Spotify track artist",
+                "Spotify",
+                spotify_track_url,
+            )
+
+            if credit_key in credit_keys:
+                continue
+
+            credit_id = stable_id(
+                "CRD_",
+                "credit",
+                "|".join(str(value) for value in credit_key),
+            )
+            new_credit = {column: "" for column in credit_columns}
+            new_credit.update({
+                "credit_id": credit_id,
+                "recording_id": recording_id,
+                "artist_id": artist_id,
+                "artist_name": artist_name,
+                "role": "performer",
+                "source_role": "Spotify track artist",
+                "artist_order": artist_order,
+                "source": "Spotify",
+                "source_url": spotify_track_url,
+            })
+            credits.append(new_credit)
+            credit_keys.add(credit_key)
+            created_credits += 1
+
+    final_recordings_df = pd.DataFrame(
+        list(recordings.values()),
+        columns=recording_columns,
+    )
+    final_artists_df = pd.DataFrame(
+        list(artists.values()),
+        columns=artist_columns,
+    )
+    final_credits_df = pd.DataFrame(
+        credits,
+        columns=credit_columns,
+    )
+
+    write_dataframe(final_recordings_df, RECORDINGS_FILE)
+    write_dataframe(final_artists_df, ARTISTS_FILE)
+    write_dataframe(final_credits_df, CREDITS_FILE)
+    write_dataframe(canonical_relationships_df, RELATIONSHIP_FILE)
+
+    print()
+    print("=" * 80)
+    print("STEP 5 — CANONICAL TARGET INTEGRATION")
+    print("=" * 80)
+    print("Matched relationship targets integrated:", integrated_relationships)
+    print("New canonical recordings:", created_recordings)
+    print("Existing canonical recordings reused:", reused_recordings)
+    print("New Spotify artists:", created_artists)
+    print("New Spotify performer credits:", created_credits)
+    if matched_without_artist_ids:
+        print(
+            "Matched targets without safely structured Spotify artist IDs:",
+            matched_without_artist_ids,
+        )
+
+
 
 state = load_state()
 
 if BLIND_PHASE1_CACHE:
 
     state = {
-        "playlist_exported": True,
+        "playlist_exported": False,
         "tracks_processed": [],
         "relationships_parsed": [],
         "spotify_enriched": False,
@@ -1247,16 +2593,59 @@ else:
 
             if not existing_matches_df.empty:
 
-                matched_rows = (
+                restored_rows = (
                     existing_matches_df
                     .to_dict("records")
+                )
+
+                # Historical checkpoints may contain more than one row
+                # for the same Spotify track when a later decision
+                # superseded an earlier unresolved/review result.
+                # Treat spotify_track_id as the checkpoint identity and
+                # keep the last assertion for each track.
+                restored_by_spotify_id = {}
+                restored_without_spotify_id = []
+
+                for restored_row in restored_rows:
+
+                    restored_spotify_id = str(
+                        restored_row.get(
+                            "spotify_track_id",
+                            ""
+                        )
+                        or ""
+                    ).strip()
+
+                    if restored_spotify_id:
+                        restored_by_spotify_id[
+                            restored_spotify_id
+                        ] = restored_row
+                    else:
+                        restored_without_spotify_id.append(
+                            restored_row
+                        )
+
+                matched_rows = (
+                    list(restored_by_spotify_id.values())
+                    + restored_without_spotify_id
+                )
+
+                duplicate_count = (
+                    len(restored_rows)
+                    - len(matched_rows)
                 )
 
                 print(
                     "RESTORED MATCH CHECKPOINT:",
                     len(matched_rows),
-                    "existing track results"
+                    "unique track results"
                 )
+
+                if duplicate_count:
+                    print(
+                        "COLLAPSED HISTORICAL MATCH CHECKPOINT DUPLICATES:",
+                        duplicate_count
+                    )
 
         except Exception as e:
 
@@ -1265,6 +2654,54 @@ else:
                 repr(e)
             )
 
+
+
+def upsert_matched_row(new_row):
+    """Store exactly one current checkpoint assertion per Spotify track."""
+
+    spotify_track_id = str(
+        new_row.get(
+            "spotify_track_id",
+            ""
+        )
+        or ""
+    ).strip()
+
+    if not spotify_track_id:
+        matched_rows.append(
+            new_row
+        )
+        return
+
+    for index, existing_row in enumerate(
+        matched_rows
+    ):
+
+        existing_spotify_track_id = str(
+            existing_row.get(
+                "spotify_track_id",
+                ""
+            )
+            or ""
+        ).strip()
+
+        if existing_spotify_track_id != spotify_track_id:
+            continue
+
+        # Preserve fields added by later review/canonical-identity
+        # phases while replacing the current Phase-1 assertion fields.
+        merged_row = dict(
+            existing_row
+        )
+        merged_row.update(
+            new_row
+        )
+        matched_rows[index] = merged_row
+        return
+
+    matched_rows.append(
+        new_row
+    )
 
 
 def is_whosampled_artist_profile(url):
@@ -2360,6 +3797,17 @@ def request_whosampled_candidate(
 
         if verified_status == "matched":
 
+            # Archive every automatically verified primary track page.
+            #
+            # The Playwright page is already loaded and verified here,
+            # so this performs no additional WhoSampled request.
+            # Step 4 depends on these saved primary HTML files when
+            # producing normalized recordings and relationships.
+            save_verified_track_html(
+                page,
+                title
+            )
+
             return (
                 "matched",
                 verified
@@ -2452,7 +3900,8 @@ with sync_playwright() as p:
         ).strip()
 
         artists = artist_list(
-            row["artist_names"]
+            row["artist_names"],
+            row.get("artists_json", "")
         )
 
         print()
@@ -3215,7 +4664,7 @@ with sync_playwright() as p:
         # Save track-level checkpoint.
         # ----------------------------------------------------
 
-        matched_rows.append({
+        upsert_matched_row({
             "spotify_track_id":
                 row["spotify_track_id"],
             "isrc":
@@ -3922,436 +5371,16 @@ relationships_df = pd.DataFrame(
 # NORMALIZED CANONICAL OUTPUTS
 # ============================================================
 #
-# These files separate:
-#
-#   recordings.csv
-#       one row per recording
-#
-#   credits.csv
-#       one row per artist/role credit
-#
-#   relationships.csv
-#       one row per graph relationship
-#
-# The older relationship table remains available above as an
-# intermediate/compatibility artifact. These normalized files
-# are the foundation for the eventual Neo4j model.
+# Spotify seed recordings/artists are the baseline identities.
+# Approved WhoSampled pages enrich those identities, and the
+# relationship rows are normalized against the same recording IDs.
 # ============================================================
 
-recording_rows = []
-credit_rows = []
-recording_ids_by_url = {}
-
-# Use the approved primary pages rather than relationship rows
-# so a recording with four relationships is still represented
-# only once.
-for html_name in accepted_primary_html_files:
-
-    html_path = (
-        HTML_DIR / html_name
-    )
-
-    try:
-
-        soup = load_html_file(
-            html_path
-        )
-
-        source = extract_source_metadata(
-            soup
-        )
-
-    except Exception as exc:
-
-        print(
-            "NORMALIZED RECORDING PARSE ERROR:",
-            html_path,
-            repr(exc)
-        )
-        continue
-
-    source_url = str(
-        source.get(
-            "source_url",
-            ""
-        )
-        or ""
-    ).strip()
-
-    if not source_url:
-        continue
-
-    source_url = source_url.rstrip("/")
-
-    # Stable internal recording ID based on the source's
-    # canonical WhoSampled URL.
-    recording_id = (
-        "REC_"
-        + hashlib.sha1(
-            source_url.encode(
-                "utf-8"
-            )
-        ).hexdigest()[:16]
-    )
-
-    recording_ids_by_url[
-        source_url
-    ] = recording_id
-
-    # Local Phase-1 artwork cache.
-    media_path = (
-        HTML_DIR.parent
-        / "whosampled_media"
-        / (
-            safe_filename(
-                source.get(
-                    "source_title",
-                    ""
-                )
-            )
-            + ".png"
-        )
-    )
-
-    media_status = (
-        "captured"
-        if media_path.exists()
-        else "unavailable"
-    )
-
-    recording_rows.append({
-        "recording_id":
-            recording_id,
-
-        "title":
-            source.get(
-                "source_title",
-                "",
-            ),
-
-        "artist_names":
-            source.get(
-                "source_artists",
-                "",
-            ),
-
-        "album":
-            source.get(
-                "source_album",
-                "",
-            ),
-
-        "label":
-            source.get(
-                "source_label",
-                "",
-            ),
-
-        "release_year":
-            source.get(
-                "source_release_year",
-                "",
-            ),
-
-        "duration":
-            source.get(
-                "source_duration",
-                "",
-            ),
-
-        "genre":
-            source.get(
-                "source_genre",
-                "",
-            ),
-
-        "keywords":
-            source.get(
-                "source_keywords",
-                "",
-            ),
-
-        "whosampled_url":
-            source_url,
-
-        "whosampled_thumbnail_url":
-            source.get(
-                "source_thumbnail_url",
-                "",
-            ),
-
-        "whosampled_thumbnail_path":
-            str(
-                media_path
-            )
-            if media_path.exists()
-            else "",
-
-        "whosampled_thumbnail_status":
-            media_status,
-
-        "youtube_video_id":
-            source.get(
-                "source_youtube_video_id",
-                "",
-            ),
-
-        "youtube_url":
-            source.get(
-                "source_youtube_url",
-                "",
-            ),
-
-        "youtube_thumbnail_url":
-            source.get(
-                "source_youtube_thumbnail_url",
-                "",
-            ),
-    })
-
-    # --------------------------------------------------------
-    # Credits.
-    # --------------------------------------------------------
-
-    raw_credits = source.get(
-        "source_credits",
-        "[]",
-    )
-
-    try:
-
-        parsed_credits = json.loads(
-            raw_credits
-            if raw_credits
-            else "[]"
-        )
-
-    except Exception:
-
-        parsed_credits = []
-
-    credit_number = 0
-
-    for credit in parsed_credits:
-
-        artist_name = str(
-            credit.get(
-                "artist",
-                ""
-            )
-            or ""
-        ).strip()
-
-        role = str(
-            credit.get(
-                "role",
-                ""
-            )
-            or ""
-        ).strip()
-
-        source_role = str(
-            credit.get(
-                "source_role",
-                ""
-            )
-            or ""
-        ).strip()
-
-        if not artist_name or not role:
-            continue
-
-        credit_number += 1
-
-        credit_key = (
-            f"{recording_id}|"
-            f"{artist_name}|"
-            f"{role}|"
-            f"{source_role}"
-        )
-
-        credit_id = (
-            "CRD_"
-            + hashlib.sha1(
-                credit_key.encode(
-                    "utf-8"
-                )
-            ).hexdigest()[:16]
-        )
-
-        credit_rows.append({
-            "credit_id":
-                credit_id,
-
-            "recording_id":
-                recording_id,
-
-            "artist_name":
-                artist_name,
-
-            "role":
-                role,
-
-            "source_role":
-                source_role,
-
-            "source":
-                "WhoSampled",
-
-            "source_url":
-                source_url,
-        })
-
-recordings_df = pd.DataFrame(
-    recording_rows
-)
-
-credits_df = pd.DataFrame(
-    credit_rows
-)
-
-# ------------------------------------------------------------
-# Normalize the current relationship rows.
-#
-# Source recording IDs can be resolved now.
-# Target recording IDs remain blank until we begin collecting
-# each related recording's own WhoSampled track page.
-# ------------------------------------------------------------
-
-normalized_relationship_rows = []
-
-for _, row in relationships_df.iterrows():
-
-    source_url = str(
-        row.get(
-            "source_url",
-            ""
-        )
-        or ""
-    ).strip().rstrip("/")
-
-    source_recording_id = (
-        recording_ids_by_url.get(
-            source_url,
-            ""
-        )
-    )
-
-    relationship_key = (
-        f"{source_recording_id}|"
-        f"{row.get('relationship_type', '')}|"
-        f"{row.get('related_track', '')}|"
-        f"{row.get('related_artist', '')}|"
-        f"{row.get('whosampled_relationship_url', '')}"
-    )
-
-    relationship_id = (
-        "REL_"
-        + hashlib.sha1(
-            relationship_key.encode(
-                "utf-8"
-            )
-        ).hexdigest()[:16]
-    )
-
-    normalized_relationship_rows.append({
-        "relationship_id":
-            relationship_id,
-
-        "source_recording_id":
-            source_recording_id,
-
-        # Target recording identity will be populated when the
-        # related track's own WhoSampled page is collected and
-        # reconciled.
-        "target_recording_id":
-            "",
-
-        "relationship_type":
-            row.get(
-                "relationship_type",
-                "",
-            ),
-
-        "related_track":
-            row.get(
-                "related_track",
-                "",
-            ),
-
-        "related_artist":
-            row.get(
-                "related_artist",
-                "",
-            ),
-
-        "year":
-            row.get(
-                "year",
-                "",
-            ),
-
-        "whosampled_relationship_url":
-            row.get(
-                "whosampled_relationship_url",
-                "",
-            ),
-
-        "detail":
-            row.get(
-                "detail",
-                "",
-            ),
-    })
-
-normalized_relationships_df = pd.DataFrame(
-    normalized_relationship_rows
-)
-
-write_dataframe(
-    recordings_df,
-    RECORDINGS_FILE
-)
-
-write_dataframe(
-    credits_df,
-    CREDITS_FILE
-)
-
-write_dataframe(
-    normalized_relationships_df,
-    RELATIONSHIP_FILE
-)
-
-print()
-print(
-    "NORMALIZED RECORDINGS:",
-    len(recordings_df)
-)
-
-print(
-    "NORMALIZED CREDITS:",
-    len(credits_df)
-)
-
-print(
-    "NORMALIZED RELATIONSHIPS:",
-    len(normalized_relationships_df)
-)
-
-print(
-    "RECORDINGS FILE:",
-    RECORDINGS_FILE
-)
-
-print(
-    "CREDITS FILE:",
-    CREDITS_FILE
-)
-
-print(
-    "RELATIONSHIPS FILE:",
-    RELATIONSHIP_FILE
+write_normalized_outputs(
+    accepted_html_files=accepted_primary_html_files,
+    matched_file=MATCH_FILE,
+    spotify_file=SPOTIFY_FILE,
+    relationship_rows=relationships_df.to_dict("records"),
 )
 
 
@@ -4376,6 +5405,16 @@ state[
 )
 
 save_state(state)
+
+
+if STOP_AFTER_STEP4:
+    print()
+    print("=" * 80)
+    print("STOPPING AFTER STEP 4 AS REQUESTED")
+    print("=" * 80)
+    print("Normalized production outputs have been written.")
+    print("Step 5 Spotify enrichment was not started.")
+    raise SystemExit(0)
 
 
 # STEP 5 — RELATED TRACK → SPOTIFY
@@ -4421,6 +5460,16 @@ if not relationships_df.empty:
                     "spotify_track_id"
                 ),
 
+            "spotify_uri":
+                result.get(
+                    "spotify_uri"
+                ),
+
+            "spotify_url":
+                result.get(
+                    "spotify_url"
+                ),
+
             "spotify_isrc":
                 result.get(
                     "isrc"
@@ -4436,14 +5485,29 @@ if not relationships_df.empty:
                     "artist_names"
                 ),
 
+            "spotify_artist_ids":
+                result.get(
+                    "artist_ids"
+                ),
+
             "spotify_album_name":
                 result.get(
                     "album_name"
                 ),
 
+            "spotify_album_id":
+                result.get(
+                    "album_id"
+                ),
+
             "spotify_album_release_date":
                 result.get(
                     "album_release_date"
+                ),
+
+            "spotify_album_release_precision":
+                result.get(
+                    "album_release_precision"
                 ),
 
             "spotify_album_image_url":
@@ -4454,6 +5518,11 @@ if not relationships_df.empty:
             "spotify_album_label":
                 result.get(
                     "album_label"
+                ),
+
+            "spotify_duration_ms":
+                result.get(
+                    "duration_ms"
                 ),
         })
 
@@ -4475,6 +5544,64 @@ if not relationships_df.empty:
     print(
         "Enriched relationships:",
         len(enriched_df)
+    )
+
+    # ========================================================
+    # SPOTIFY CONTRIBUTOR REVIEW GATE
+    # ========================================================
+    #
+    # Spotify candidates classified as "review" must be
+    # explicitly accepted, rejected, or left unresolved.
+    #
+    # The review UI operates on the already-written
+    # relationships_enriched.csv and persists every decision.
+    # No Spotify matching is performed by the UI itself.
+    # ========================================================
+
+    spotify_review_count = int(
+        enriched_df[
+            "spotify_match_status"
+        ]
+        .fillna("")
+        .eq("review")
+        .sum()
+    )
+
+    print()
+    print("=" * 80)
+    print("SPOTIFY CONTRIBUTOR REVIEW")
+    print("=" * 80)
+
+    if spotify_review_count:
+
+        print(
+            "Spotify review candidates:",
+            spotify_review_count,
+        )
+
+        enriched_df = run_spotify_candidate_review(
+            ENRICHED_FILE,
+            SPOTIFY_FILE,
+        )
+
+        state[
+            "spotify_review_complete"
+        ] = True
+
+        save_state(
+            state
+        )
+
+    else:
+
+        print(
+            "No Spotify review candidates."
+        )
+
+    # Fold final accepted/matched Spotify resolutions into the canonical
+    # graph outputs only after the review gate has finalized decisions.
+    integrate_step5_spotify_targets(
+        enriched_df
     )
 
 else:
@@ -4510,6 +5637,18 @@ print(
 print(
     "Relationships:",
     RELATIONSHIP_FILE
+)
+print(
+    "Recordings:",
+    RECORDINGS_FILE
+)
+print(
+    "Artists:",
+    ARTISTS_FILE
+)
+print(
+    "Credits:",
+    CREDITS_FILE
 )
 print(
     "Enriched:",
